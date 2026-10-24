@@ -29,5 +29,18 @@
   },
   "scripts": {
     "test": "node test/host.test.mjs && node test/client.test.cjs"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zengxiaolou/dsh-session-rail"
+  },
+  "homepage": "https://github.com/zengxiaolou/dsh-session-rail",
+  "bugs": {
+    "url": "https://github.com/zengxiaolou/dsh-session-rail/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness"
+  ]
 }
