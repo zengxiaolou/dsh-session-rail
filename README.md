@@ -180,6 +180,7 @@ npm test     # = node test/host.test.mjs && node test/client.test.cjs
 ## 市场与发布
 
 - npm：`npm publish --registry=https://registry.npmjs.org`（默认 registry 若是镜像站，必须显式指定）。
-- 市场条目：`docs/market-entry.json` 是按 `dshmarket.com/index.json` 的 `plugins[]` 结构准备好的**待提交条目**（`category: session`），
-  提交到 awesome-dsh-plugin 列表后由市场抓取；`engines.dsh` 一并带上，便于市场按版本过滤。
+- 市场收录：条目在 [`market/dsh-session-rail.yml`](market/dsh-session-rail.yml)，格式即 awesome-dsh-plugin 的
+  `data/plugins/<owner>__<repo>.yml`（一个文件就是全部投稿）。合并后由其脚本生成列表，`dshmarket.com/index.json` 再抓取它。
+  `category: session`，`description.en` 必填、`zh` 可选；图标省略时回退到作者头像。
 - 版本策略：只递增补丁位（`0.1.9 → 0.1.10`），只有大改才动 middle 位。
