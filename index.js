@@ -10,7 +10,7 @@
  * endpoint only reads (git plumbing, a progress directory, `gh auth status`).
  */
 import { execFile } from 'node:child_process';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const ROUTE_PREFIX = '/api/session-rail';
@@ -20,7 +20,18 @@ const MAX_FILES = 60;
 const MAX_PROGRESS_FILES = 64;
 const MAX_PROGRESS_BYTES = 512 * 1024;
 export const PLUGIN_ID = 'dsh-session-rail';
-const PLUGIN_VERSION = '0.1.10';
+/**
+ * Read from the manifest, not a constant: the release pipeline bumps
+ * package.json on its own, and a second copy of the version silently drifts
+ * (it did — 0.1.10 published as 0.1.11 while this said 0.1.10).
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+  } catch {
+    return '0.0.0';
+  }
+})();
 /** How many appended session events one turn scan reads back from the tail. */
 const TURN_SCAN_EVENTS = 400;
 
