@@ -1,0 +1,33 @@
+{
+  "name": "@local/dsh-session-rail",
+  "version": "0.1.4",
+  "private": true,
+  "type": "module",
+  "description": "Session guide rail for the DSH right sidebar: progress, changes and sources tabs beside the PR tab.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "test": "node test/host.test.mjs && node test/client.test.cjs"
+  }
+}

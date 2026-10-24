@@ -1,0 +1,3 @@
+- insert:
+    - id: session-rail
+      name: '@local/dsh-session-rail'
