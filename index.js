@@ -19,7 +19,7 @@ const MAX_FILES = 60;
 /** The progress protocol caps one directory at 64 task files. */
 const MAX_PROGRESS_FILES = 64;
 const MAX_PROGRESS_BYTES = 512 * 1024;
-export const PLUGIN_ID = '@local/dsh-session-rail';
+export const PLUGIN_ID = 'dsh-session-rail';
 const PLUGIN_VERSION = '0.1.5';
 /** How many appended session events one turn scan reads back from the tail. */
 const TURN_SCAN_EVENTS = 400;

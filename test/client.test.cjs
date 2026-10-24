@@ -107,7 +107,7 @@ async function mount(component, props) {
 
 (async () => {
   const { id, mod } = loadModule();
-  assert.equal(id, '@local/dsh-session-rail');
+  assert.equal(id, 'dsh-session-rail');
 
   // 1. no betterSidebar service: apply must not throw and must register nothing
   const emptyCtx = { effect: (fn) => fn(), get: () => undefined, inject: (keys, cb) => cb(emptyCtx) };

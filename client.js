@@ -7,7 +7,7 @@
  * reader of the host route defined in index.js; this half writes nothing.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-session-rail',
+  id: 'dsh-session-rail',
   factory(require) {
     const React = require('react');
     const h = React.createElement;

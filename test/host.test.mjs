@@ -34,8 +34,8 @@ const sessionsService = {
   get: (id) => (id === 's-live' ? makeSession(liveEvents) : id === 's-closed' ? makeSession(closedEvents) : undefined),
 };
 const clientModulesService = {
-  graph: () => ({ rev: 'r1', release: 'x', entries: [{ id: 'dsh-pr-panel' }, { id: '@local/dsh-session-rail' }], batches: [[]] }),
-  clientPath: (id) => (id === '@local/dsh-session-rail' ? '/tmp/rail/client.js' : undefined),
+  graph: () => ({ rev: 'r1', release: 'x', entries: [{ id: 'dsh-pr-panel' }, { id: 'dsh-session-rail' }], batches: [[]] }),
+  clientPath: (id) => (id === 'dsh-session-rail' ? '/tmp/rail/client.js' : undefined),
 };
 const routes = [];
 const ctx = {
