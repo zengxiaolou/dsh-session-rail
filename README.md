@@ -2,6 +2,14 @@
 
 ![dsh-session-rail](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/images/promo.png)
 
+<p>
+<a href="https://www.npmjs.com/package/dsh-session-rail"><img alt="npm" src="https://img.shields.io/npm/v/dsh-session-rail?color=2f81f7&label=npm"></a>
+<a href="https://www.npmjs.com/package/dsh-session-rail"><img alt="downloads" src="https://img.shields.io/npm/dw/dsh-session-rail?color=3fb950"></a>
+<a href="https://github.com/zengxiaolou/dsh-session-rail/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/npm/l/dsh-session-rail?color=bf8700"></a>
+<img alt="dsh plugin" src="https://img.shields.io/badge/DSH-plugin-7aa2ff">
+<a href="https://github.com/zengxiaolou/dsh-session-rail/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/zengxiaolou/dsh-session-rail?color=8250df"></a>
+</p>
+
 
 给 DSH 右侧栏加一个常驻视图：**进度**，和已有的 `PR` 标签并排。显隐、宽度、`+` 新标签菜单全部沿用宿主原生右栏，本插件不另起一列。
 
