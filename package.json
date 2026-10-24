@@ -2,7 +2,7 @@
   "name": "dsh-session-rail",
   "version": "0.1.11",
   "type": "module",
-  "description": "Progress tab for the DSH right sidebar (session turn status + long-task progress).",
+  "description": "Session status at a glance for the DSH Web UI: five-state header counters (running / asking / error / interrupted / unread), a pinned hover panel, per-workspace badges in the left rail, and a Progress tab for long tasks.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -34,7 +34,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zengxiaolou/dsh-session-rail"
+    "url": "git+https://github.com/zengxiaolou/dsh-session-rail.git"
   },
   "homepage": "https://github.com/zengxiaolou/dsh-session-rail",
   "bugs": {
@@ -43,7 +43,12 @@
   "keywords": [
     "dsh",
     "dsh-plugin",
-    "deepseek-harness"
+    "deepseek-harness",
+    "session",
+    "status",
+    "sidebar",
+    "workspace",
+    "counters"
   ],
   "license": "MIT"
 }

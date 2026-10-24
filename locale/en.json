@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session Rail",
-    "description": "Adds a Progress tab to the right sidebar, next to the PR tab."
+    "description": "Five-state session counters in the conversation header (running / asking / error / interrupted / unread), per-workspace badges in the left rail, and a Progress tab in the right sidebar — see where work is happening without opening every folder."
   }
 }
