@@ -28,7 +28,7 @@
 
 | 顶部五态计数（深色） | 左栏工作区徽标（深色） |
 | --- | --- |
-| ![顶部五态计数](docs/header-counter-5tone.png) | ![左栏工作区徽标](docs/workspace-badge.png) |
+| ![顶部五态计数](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/header-counter-5tone.png) | ![左栏工作区徽标](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/workspace-badge.png) |
 
 
 给 DSH 右侧栏加一个常驻视图：**进度**，和已有的 `PR` 标签并排。显隐、宽度、`+` 新标签菜单全部沿用宿主原生右栏，本插件不另起一列。
@@ -47,7 +47,7 @@
 
 ## 顶部会话计数
 
-![顶部会话计数](docs/header-counts-light.png)
+![顶部会话计数](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/header-counts-light.png)
 
 插在 `conversation.session.header.utilities`（宿主声明为 “右对齐的会话工具区”）里，`order: -10` 排在所有工具控件之前——也就是**标题右侧、右侧图标按钮左侧那段空白**。这段由 shell 的 `ConversationSessionHeader` 渲染，所以对话 / 轨迹 / 上下文 / 画廊等所有视图页共用同一处，切换页面不掉。
 
@@ -69,7 +69,7 @@
 
 | 深色 | 深色 + hover |
 | --- | --- |
-| ![深色](docs/header-counts-dark.png) | ![深色浮层](docs/header-counts-dark-panel.png) |
+| ![深色](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/header-counts-dark.png) | ![深色浮层](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/header-counts-dark-panel.png) |
 
 ## 左栏工作区徽标
 
