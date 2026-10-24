@@ -1,5 +1,8 @@
 # 会话引导栏（Session Rail）
 
+![dsh-session-rail](https://raw.githubusercontent.com/zengxiaolou/dsh-session-rail/main/docs/images/promo.png)
+
+
 给 DSH 右侧栏加一个常驻视图：**进度**，和已有的 `PR` 标签并排。显隐、宽度、`+` 新标签菜单全部沿用宿主原生右栏，本插件不另起一列。
 
 > 0.1.5 起移除了「变更」「来源」两个 tab（右侧栏太挤、日常用不上）。宿主侧的 `/changes`、`/sources` 只读接口保留下来当诊断口，客户端不再注册标签。
