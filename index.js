@@ -20,7 +20,7 @@ const MAX_FILES = 60;
 const MAX_PROGRESS_FILES = 64;
 const MAX_PROGRESS_BYTES = 512 * 1024;
 export const PLUGIN_ID = 'dsh-session-rail';
-const PLUGIN_VERSION = '0.1.8';
+const PLUGIN_VERSION = '0.1.10';
 /** How many appended session events one turn scan reads back from the tail. */
 const TURN_SCAN_EVENTS = 400;
 
@@ -352,6 +352,9 @@ const TURN_TONE = {
 /** Upper bound on Sessions one /turns round may classify. */
 const MAX_TURN_IDS = 24;
 
+/** The tool that parks a turn until the user answers. */
+const ASK_TOOL = 'ask_user_question';
+
 /**
  * Last turn's outcome for one Session, read from the tail of its own log.
  *
@@ -385,7 +388,25 @@ function readTurnState(ctx, sessionId) {
   }
   if (!start) return { state: 'unknown', kind: null };
   if (!end || Number(end.seq) < Number(start.seq)) {
-    return { state: 'running', kind: null, turn: start.data?.turn ?? null };
+    // An open turn is not always working: ask_user_question parks it until the
+    // user answers. Telling the two apart is what lets the header say "询问"
+    // instead of claiming a Session is busy while it is actually waiting.
+    let pendingCall = null;
+    const answered = new Set();
+    for (const event of events) {
+      if (event?.type === 'tool/call' && event.data?.name === ASK_TOOL) {
+        pendingCall = event.data?.callId ?? `seq:${event.seq}`;
+      } else if (event?.type === 'tool/result') {
+        const callId = event.data?.callId;
+        if (callId !== undefined) answered.add(callId);
+      }
+    }
+    const asking = pendingCall !== null && !answered.has(pendingCall);
+    return {
+      state: asking ? 'question' : 'running',
+      kind: asking ? ASK_TOOL : null,
+      turn: start.data?.turn ?? null,
+    };
   }
   const kind = typeof end.data?.reason?.kind === 'string' ? end.data.reason.kind : null;
   return {
@@ -553,6 +574,28 @@ async function handleRequest(ctx, req, res) {
     }
     if (url.pathname === `${ROUTE_PREFIX}/turn`) {
       sendJson(res, 200, readTurn(ctx, sessionId));
+      return;
+    }
+    if (url.pathname === `${ROUTE_PREFIX}/workspaces`) {
+      // The left rail's badges need the same membership the sidebar uses, so the
+      // host answers with the registry's own projection: `sessionIds` is already
+      // filtered by the canonical-cwd header index, which the client cannot
+      // reproduce from `cwd` strings alone (symlinks, monorepos, moved folders).
+      let workspaces = [];
+      try {
+        workspaces = ctx.get('workspaceRegistry')?.list?.() ?? [];
+      } catch {
+        workspaces = [];
+      }
+      sendJson(res, 200, {
+        ok: true,
+        workspaces: workspaces.map((workspace) => ({
+          id: String(workspace.id),
+          title: String(workspace.title ?? ''),
+          path: String(workspace.path ?? ''),
+          sessionIds: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.map(String) : [],
+        })),
+      });
       return;
     }
     if (url.pathname === `${ROUTE_PREFIX}/turns`) {

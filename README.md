@@ -33,21 +33,38 @@
 
 | 段 | 含义 | 数据来源 |
 | --- | --- | --- |
-| ● N 运行（蓝） | 此刻有活跃回合的根会话数 | 客户端 `sessions.list` 快照里的 `running` |
+| ● N 运行（蓝） | 有活跃回合、且真的在干活的根会话数 | 客户端 `sessions.list` 的 `running` + `/turns` 排除“等你回答” |
+| ● N 询问（橙） | 回合停在 `ask_user_question` 上，等你回答 | 宿主 `/turns` 看当前回合内有无未 `tool/result` 的 `ask_user_question` 调用 |
 | ● N 出错（红） | 上一个回合以 `blocked` / `error` 结束、且还没看过的 | 宿主 `/turns` 读会话日志尾部的 `turn/end.data.reason.kind` |
-| ● N 中断（黄） | 回合以 `aborted` / `interrupted` 结束（没做完就停了） | 同上 |
+| ● N 中断（灰） | 回合以 `aborted` / `interrupted` 结束（没做完就停了） | 同上 |
 | ● N 未读（绿） | 已正常结束（`completed` / `max-tokens`）、但本浏览器还没看过的 | `updatedAt` 对比已读水位 + `/turns` 判定 |
 
 - **没有现成字段**：DSH 不记录“某个会话是否已读”，所以已读水位由客户端持有——首次加载把当时的全部会话记为已读（否则一上来就是几十条未读），之后“看着的会话”按 `updatedAt` 前进水位，**离开时正在跑、回来已经结束**的会话由 running→false 这次跃迁直接记成未读。
-- **颜色来自会话自己的结局**：`turn/end` 的 `reason.kind` 决定色调——`completed`/`max-tokens` 绿、`aborted`/`interrupted` 黄、`blocked`/`error` 红。查不到（会话已离开内存）返回 `unknown`，落回绿色“未读”，不猜成别的颜色。
-- **只轮询结局**：运行数订阅 `sessions.list`，状态真变才算；已结束会话的结局每 15s 向宿主批量问一次（单次最多 24 个），页面不可见时不发。
-- **弱干扰**：11px 三级文字色；数字为 0 的那段整段隐藏，四段都为 0 时退化成一颗很淡的点（`data-idle` 0.45 透明度，hover 回到 0.95）。
-- **hover / focus 才出细节**：浮层按紧急度分区（出错 → 中断 → 运行 → 未读）列出会话标题与相对时间，点一下直接跳转；键盘 Tab 可进，Esc 关闭，`aria-label` 给出四段计数。
-- 文案进的是插件自己的 locale 命名空间（`locale.register('session-rail', {zh, en})`），跟随 GUI 语言切换；颜色全部走 `--dsw-alias-*` 别名 token，深浅色各自成立（浮层用 `bg-layer-3` 实心面，不用会透出正文字色的 `bg-overlay`）。
+- **颜色来自会话自己的结局**：`turn/end` 的 `reason.kind` 决定色调——`completed`/`max-tokens` 绿、`aborted`/`interrupted` 中性灰、`blocked`/`error` 红。查不到（会话已离开内存）返回 `unknown`，落回绿色“未读”，不猜成别的颜色。
+- **“在跑”与“等你回答”分开算**：回合开着不等于在干活。当前回合里有 `ask_user_question` 调用、且它的 `tool/result` 还没出现 → `question`，从蓝色里扣掉，进橙色那段（官方 warning 色，和侧栏“等待回答”一致）。
+- **只轮询结局**：运行数订阅 `sessions.list`，状态真变才算；结局每 15s 向宿主批量问一次（单次最多 24 个），页面不可见时不发。
+- **弱干扰**：11px 三级文字色；数字为 0 的那段整段隐藏，五段都为 0 时退化成一颗很淡的点（`data-idle` 0.45 透明度，hover 回到 0.95）。
+- **hover 预览，点击钉住**：hover / 键盘 focus 只是“看一眼”，移开就收起；点一下 chip 把它钉住（`data-pinned`），鼠标走进浮层不会掉，再点一次 / 点外面 / Esc 才关。浮层里的行才是跳转入口。
+- 文案进的是插件自己的 locale 命名空间（`locale.register('session-rail', {zh, en})`），跟随 GUI 语言切换；颜色走 `--dsw-alias-*` 别名 token（浮层用 `bg-layer-3` 实心面，不用会透出正文字色的 `bg-overlay`）。中断用中性灰而不是黄色：主题没有第五个状态色，橙色已经让给“等你回答”，黄色会和它撞。
 
 | 深色 | 深色 + hover |
 | --- | --- |
 | ![深色](docs/header-counts-dark.png) | ![深色浮层](docs/header-counts-dark-panel.png) |
+
+## 左栏工作区徽标
+
+工作区行是宿主的闭合组件（`ProjectRowItem`），**没有可注入的座位**，所以徽标用原生 DOM 画在
+`[data-row-key^="workspace:"]` 上，并由一个常驻在 `sidebar.footer.action` 的空组件每 1.5s 重画一次
+（React 会替换行子节点，插件不持有行内的 React 树）。
+
+- **口径**：`启迪 /api/session-rail/workspaces` 返回 `工作区 → sessionIds`（注册表自己的投影，已按 canonical cwd 过滤），
+  再对每个会话取 `/turns` 判定。`running` 计数不含停在提问上的会话；`question` 单独计。
+- **只显示有事的工作区**：`running + question = 0` 的行不画徽标，徽标里的颜色：有 `question` 用橙，否则用蓝。
+- **开关**：`localStorage["dsh-session-rail:workspace-badge:v1"] = "off"` 关掉，`removeItem` 恢复默认开。
+- **已知缺口**：注册表 `sessionIds` 未按归档集过滤，归档会话若仍在跑会被算进来；自动化会话（本机 69/230）目前**计入**，
+  若发现“运维行长期亮灯”，按 `origin`/会话名前缀再过滤。
+
+> ⚠️ 未在真实 GUI 验证：徽标定位依赖 `data-row-key` 锚点与 sidebar footer 座位，两者都需要重启后手验（拖拽/展开后有无重影、关闭开关有无残留）。
 
 ## 交互
 
@@ -61,6 +78,7 @@
 ```
 GET /api/session-rail/turn?sessionId=<会话 id>
 GET /api/session-rail/turns?ids=<逗号分隔，最多 24 个>   # 批量：每会话最后一个回合的结局
+GET /api/session-rail/workspaces                          # 工作区 → sessionIds（左栏徽标用）
 GET /api/session-rail/progress?cwd=<绝对路径>&sessionId=<会话 id>
 GET /api/session-rail/changes?cwd=<绝对路径>        # 0.1.5 起无客户端使用，保留为只读诊断口
 GET /api/session-rail/sources?cwd=<绝对路径>        # 同上

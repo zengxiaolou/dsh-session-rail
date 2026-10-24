@@ -34,12 +34,23 @@ const makeSession = (events) => ({
   snapshotEvents: (from, to) => events.filter((e) => e.seq >= from && e.seq < to),
   requestContext: () => ({ provider: 'p', model: 'm', contextWindow: 200_000 }),
 });
+const askingEvents = [
+  { type: 'turn/start', seq: 1, time: now - 20_000, data: { turn: 9 } },
+  { type: 'tool/call', seq: 2, time: now - 15_000, data: { name: 'ask_user_question', callId: 'c1' } },
+];
+const askedEvents = [
+  ...askingEvents,
+  { type: 'tool/result', seq: 3, time: now - 10_000, data: { callId: 'c1' } },
+  { type: 'tool/call', seq: 4, time: now - 9_000, data: { name: 'bash', callId: 'c2' } },
+];
 const sessionLogs = {
   's-live': liveEvents,
   's-closed': closedEvents,
   's-err': closedWith('blocked'),
   's-stop': closedWith('aborted'),
   's-fork': closedWith('forked'),
+  's-ask': askingEvents,
+  's-asked': askedEvents,
 };
 const sessionsService = {
   get: (id) => (sessionLogs[id] === undefined ? undefined : makeSession(sessionLogs[id])),
@@ -47,6 +58,12 @@ const sessionsService = {
 const clientModulesService = {
   graph: () => ({ rev: 'r1', release: 'x', entries: [{ id: 'dsh-pr-panel' }, { id: 'dsh-session-rail' }], batches: [[]] }),
   clientPath: (id) => (id === 'dsh-session-rail' ? '/tmp/rail/client.js' : undefined),
+};
+const workspaceRegistryService = {
+  list: () => [
+    { id: 'w-study', path: '/Users/x/study', title: '探索', sessionIds: ['s-live', 's-closed', 's-err'] },
+    { id: 'w-empty', path: '/Users/x/empty', title: '空目录', sessionIds: [] },
+  ],
 };
 const routes = [];
 const ctx = {
@@ -57,6 +74,7 @@ const ctx = {
       ? { schemas: () => [{ name: 'mcp__alpha__one' }, { name: 'mcp__alpha__two' }, { name: 'bash' }] }
       : name === 'sessions' ? sessionsService
       : name === 'clientModules' ? clientModulesService
+      : name === 'workspaceRegistry' ? workspaceRegistryService
       : undefined,
 };
 
@@ -233,7 +251,22 @@ try {
   res = await call('/api/session-rail/turns');
   assert.deepEqual(res.body.turns, {}, 'no ids is an empty answer, not an error');
 
-  console.log('host routes: 14/14 groups passed');
+  // 15. a turn parked on ask_user_question is waiting, not working
+  res = await call('/api/session-rail/turns?ids=s-ask,s-asked');
+  assert.equal(res.body.turns['s-ask'].state, 'question', 'an unanswered ask_user_question parks the turn');
+  assert.equal(res.body.turns['s-ask'].kind, 'ask_user_question');
+  assert.equal(res.body.turns['s-asked'].state, 'running', 'once answered the same Session is working again');
+
+  // 16. the workspaces route hands the left rail the registry's own membership
+  res = await call('/api/session-rail/workspaces');
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.workspaces.length, 2);
+  assert.equal(res.body.workspaces[0].id, 'w-study');
+  assert.equal(res.body.workspaces[0].title, '探索');
+  assert.deepEqual(res.body.workspaces[0].sessionIds, ['s-live', 's-closed', 's-err']);
+  assert.deepEqual(res.body.workspaces[1].sessionIds, [], 'an empty Workspace still reports, the client hides it');
+
+  console.log('host routes: 16/16 groups passed');
 } finally {
   rmSync(repo, { recursive: true, force: true });
 }

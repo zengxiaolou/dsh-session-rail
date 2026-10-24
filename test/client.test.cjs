@@ -289,7 +289,59 @@ async function mount(component, props) {
   assert.equal(internals.HEADER_TEXT.zh.error, '出错');
   assert.equal(internals.HEADER_TEXT.zh.interrupted, '中断');
 
-  console.log('client tabs: 7/7 groups passed');
+  // 8. a live turn parked on a question is 询问, not 运行 (waiting is not working)
+  const questionRows = [
+    { id: 'busy', at: 500, running: true },
+    { id: 'asking', at: 600, running: true },
+  ];
+  const asked = internals.readCounts(questionRows, toneStore, '', {
+    busy: { state: 'running' },
+    asking: { state: 'question' },
+  });
+  assert.equal(JSON.stringify(asked.question.map((row) => row.id)), JSON.stringify(['asking']));
+  assert.equal(JSON.stringify(asked.running.map((row) => row.id)), JSON.stringify(['busy']));
+  assert.equal(internals.HEADER_TEXT.zh.question, '询问');
+  assert.equal(internals.HEADER_TEXT.zh.panelQuestion, '等你回答的');
+
+  // 9. the chip is a real button: no native title tooltip fighting the panel,
+  //    and clicking pins rather than navigating away.
+  states.delete(internals.HeaderCounts);
+  localStore.clear();
+  const pinRows = [{ id: 'mine', displayTitle: '当前会话', updatedAt: 900, running: false }];
+  await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(pinRows), currentId: 'mine' } });
+  const pinned = await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(pinRows), currentId: 'mine' } });
+  const chipNode = pinned.nodes.find((node) => node.props && node.props.className === 'sr-hdr-chip');
+  assert.ok(chipNode, 'the chip renders as a button');
+  assert.equal(chipNode.props.title, undefined, 'no native title tooltip over the custom panel');
+  assert.equal(typeof chipNode.props.onClick, 'function');
+  const wrapNode = pinned.nodes.find((node) => node.props && node.props.className === 'sr-hdr-wrap');
+  assert.ok(wrapNode, 'the wrap carries the class the outside-click handler looks up');
+  assert.equal(wrapNode.props.style.position, 'relative');
+
+  // 10. workspace rollup: membership from the registry, question is not "running"
+  const wsRows = [
+    { id: 'a', at: 1, running: true },
+    { id: 'b', at: 2, running: true },
+    { id: 'c', at: 3, running: false },
+  ];
+  const wsList = [
+    { id: 'w1', title: '探索', sessionIds: ['a', 'b', 'c'] },
+    { id: 'w2', title: '空目录', sessionIds: [] },
+  ];
+  let rollup = internals.rollupByWorkspace(wsRows, wsList, { b: { state: 'question' } });
+  assert.equal(rollup.length, 1, 'a Workspace with nothing running is not reported');
+  assert.equal(rollup[0].id, 'w1');
+  assert.equal(rollup[0].running, 1, 'the parked Session is not counted as running');
+  assert.equal(rollup[0].question, 1);
+  // A Session missing from the store (archived / not loaded) never inflates a count.
+  rollup = internals.rollupByWorkspace([], [{ id: 'w1', title: '探索', sessionIds: ['ghost'] }], { ghost: { state: 'question' } });
+  assert.equal(rollup[0].question, 1, 'a question verdict alone still counts: it needs the user');
+  rollup = internals.rollupByWorkspace([], [{ id: 'w1', title: '探索', sessionIds: ['ghost'] }], { ghost: { state: 'running' } });
+  assert.equal(rollup.length, 0, 'a running verdict without a store row does not invent a count');
+  // The DOM painter is a no-op without a document; it must not throw.
+  assert.equal(internals.paintWorkspaceBadges([{ id: 'w1', title: 'x', running: 2, question: 0 }], true), 0);
+
+  console.log('client tabs: 10/10 groups passed');
 })().catch((error) => {
   console.error(error);
   process.exit(1);
