@@ -25,13 +25,24 @@ const closedEvents = [
   ...liveEvents,
   { type: 'turn/end', seq: 5, time: now - 60_000, data: { turn: 3, reason: { kind: 'completed' } } },
 ];
+const closedWith = (kind) => [
+  ...liveEvents,
+  { type: 'turn/end', seq: 5, time: now - 60_000, data: { turn: 3, reason: { kind } } },
+];
 const makeSession = (events) => ({
   seq: events[events.length - 1].seq,
   snapshotEvents: (from, to) => events.filter((e) => e.seq >= from && e.seq < to),
   requestContext: () => ({ provider: 'p', model: 'm', contextWindow: 200_000 }),
 });
+const sessionLogs = {
+  's-live': liveEvents,
+  's-closed': closedEvents,
+  's-err': closedWith('blocked'),
+  's-stop': closedWith('aborted'),
+  's-fork': closedWith('forked'),
+};
 const sessionsService = {
-  get: (id) => (id === 's-live' ? makeSession(liveEvents) : id === 's-closed' ? makeSession(closedEvents) : undefined),
+  get: (id) => (sessionLogs[id] === undefined ? undefined : makeSession(sessionLogs[id])),
 };
 const clientModulesService = {
   graph: () => ({ rev: 'r1', release: 'x', entries: [{ id: 'dsh-pr-panel' }, { id: 'dsh-session-rail' }], batches: [[]] }),
@@ -207,7 +218,22 @@ try {
   // 13. the plugin id must stay the package name, or the boot graph lookup breaks
   assert.equal(manifest.name, PLUGIN_ID);
 
-  console.log('host routes: 13/13 groups passed');
+  // 14. /turns paints each finished Session by how its turn actually ended
+  res = await call('/api/session-rail/turns?ids=s-live,s-closed,s-err,s-stop,s-fork,nope');
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.turns['s-live'].state, 'running', 'a turn with no closer is still running');
+  assert.equal(res.body.turns['s-closed'].state, 'done');
+  assert.equal(res.body.turns['s-closed'].kind, 'completed');
+  assert.equal(res.body.turns['s-err'].state, 'error', 'blocked / error broke the turn');
+  assert.equal(res.body.turns['s-stop'].state, 'interrupted', 'aborted / interrupted stopped short');
+  assert.equal(res.body.turns['s-fork'].state, 'done', 'a forked seed is history, not a live outcome');
+  assert.equal(res.body.turns['nope'].state, 'unknown', 'a Session that left memory is not guessed');
+  assert.equal(Object.keys(res.body.turns).length, 6, 'one verdict per requested id');
+
+  res = await call('/api/session-rail/turns');
+  assert.deepEqual(res.body.turns, {}, 'no ids is an empty answer, not an error');
+
+  console.log('host routes: 14/14 groups passed');
 } finally {
   rmSync(repo, { recursive: true, force: true });
 }

@@ -20,7 +20,7 @@ const MAX_FILES = 60;
 const MAX_PROGRESS_FILES = 64;
 const MAX_PROGRESS_BYTES = 512 * 1024;
 export const PLUGIN_ID = 'dsh-session-rail';
-const PLUGIN_VERSION = '0.1.5';
+const PLUGIN_VERSION = '0.1.8';
 /** How many appended session events one turn scan reads back from the tail. */
 const TURN_SCAN_EVENTS = 400;
 
@@ -333,6 +333,69 @@ function readTurn(ctx, sessionId) {
   };
 }
 
+/**
+ * Tone of a finished turn, keyed by the reason kinds the session log defines:
+ * `completed` / `max-tokens` ran to an end, `aborted` / `interrupted` stopped
+ * early, `blocked` / `error` broke. `forked` only exists in constructor seed
+ * history, so it reads as finished rather than as a live outcome.
+ */
+const TURN_TONE = {
+  completed: 'done',
+  'max-tokens': 'done',
+  aborted: 'interrupted',
+  interrupted: 'interrupted',
+  blocked: 'error',
+  error: 'error',
+  forked: 'done',
+};
+
+/** Upper bound on Sessions one /turns round may classify. */
+const MAX_TURN_IDS = 24;
+
+/**
+ * Last turn's outcome for one Session, read from the tail of its own log.
+ *
+ * `unknown` is a real answer: a Session that left memory cannot be judged, and
+ * guessing "done" would paint a Session that is still working green.
+ */
+function readTurnState(ctx, sessionId) {
+  let session;
+  try {
+    session = ctx.get('sessions')?.get?.(sessionId);
+  } catch {
+    session = undefined;
+  }
+  if (!session) return { state: 'unknown', kind: null };
+  const lastSeq = Number(session.seq ?? 0);
+  let events = [];
+  try {
+    events = session.snapshotEvents(Math.max(0, lastSeq - TURN_SCAN_EVENTS), lastSeq + 1) ?? [];
+  } catch {
+    return { state: 'unknown', kind: null };
+  }
+  let start = null;
+  let end = null;
+  for (const event of events) {
+    if (event?.type === 'turn/start') {
+      start = event;
+      end = null;
+    } else if (event?.type === 'turn/end') {
+      end = event;
+    }
+  }
+  if (!start) return { state: 'unknown', kind: null };
+  if (!end || Number(end.seq) < Number(start.seq)) {
+    return { state: 'running', kind: null, turn: start.data?.turn ?? null };
+  }
+  const kind = typeof end.data?.reason?.kind === 'string' ? end.data.reason.kind : null;
+  return {
+    state: TURN_TONE[kind] ?? 'done',
+    kind,
+    turn: start.data?.turn ?? null,
+    at: end.time ?? null,
+  };
+}
+
 /** `gh auth status` + the MCP namespaces the host currently exposes to tools. *//**
  * A cwd that no longer exists makes `execFile` fail with ENOENT — the same code
  * a missing binary raises. Resolve a usable directory first so "gh is missing"
@@ -490,6 +553,19 @@ async function handleRequest(ctx, req, res) {
     }
     if (url.pathname === `${ROUTE_PREFIX}/turn`) {
       sendJson(res, 200, readTurn(ctx, sessionId));
+      return;
+    }
+    if (url.pathname === `${ROUTE_PREFIX}/turns`) {
+      // Batch form for the header counters: one round trip for every finished
+      // Session the chip can colour, instead of one request per Session.
+      const ids = (url.searchParams.get('ids') || '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
+        .slice(0, MAX_TURN_IDS);
+      const turns = {};
+      for (const id of ids) turns[id] = readTurnState(ctx, id);
+      sendJson(res, 200, { ok: true, turns });
       return;
     }
     if (url.pathname === `${ROUTE_PREFIX}/report`) {

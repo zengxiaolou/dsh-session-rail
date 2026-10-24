@@ -13,6 +13,8 @@
 
 给 DSH 右侧栏加一个常驻视图：**进度**，和已有的 `PR` 标签并排。显隐、宽度、`+` 新标签菜单全部沿用宿主原生右栏，本插件不另起一列。
 
+0.1.7 起，同一份数据再往上一层：**对话面板顶部标题条**增加一组常驻计数（进行中 / 未读），不用点开右栏也能看到全站会话状态。
+
 > 0.1.5 起移除了「变更」「来源」两个 tab（右侧栏太挤、日常用不上）。宿主侧的 `/changes`、`/sources` 只读接口保留下来当诊断口，客户端不再注册标签。
 
 ## 一个 tab
@@ -22,6 +24,30 @@
 | 进度 | ① 本会话运行状态：运行中/空闲、第几轮、本轮已用时长、工具调用数、最近一个工具、**上下文占用（已用/窗口，按 65%/85% 变色）**；② 长任务列表：状态、百分比、最新消息、相对时间 | ① 会话事件流里的 `turn/start`、`turn/end`、`tool/call`；② `<cwd>/.dsh-progress/<session-id>/*.jsonl`（`dsh-task-progress` 协议） | 运行中的长任务数 |
 
 进度 tab 的第一张卡不依赖任何 producer：只要会话在跑，就有「第 N 轮 · 1 分 45 秒 · 15 次工具调用 · bash」。
+
+## 顶部会话计数
+
+![顶部会话计数](docs/header-counts-light.png)
+
+插在 `conversation.session.header.utilities`（宿主声明为 “右对齐的会话工具区”）里，`order: -10` 排在所有工具控件之前——也就是**标题右侧、右侧图标按钮左侧那段空白**。这段由 shell 的 `ConversationSessionHeader` 渲染，所以对话 / 轨迹 / 上下文 / 画廊等所有视图页共用同一处，切换页面不掉。
+
+| 段 | 含义 | 数据来源 |
+| --- | --- | --- |
+| ● N 运行（蓝） | 此刻有活跃回合的根会话数 | 客户端 `sessions.list` 快照里的 `running` |
+| ● N 出错（红） | 上一个回合以 `blocked` / `error` 结束、且还没看过的 | 宿主 `/turns` 读会话日志尾部的 `turn/end.data.reason.kind` |
+| ● N 中断（黄） | 回合以 `aborted` / `interrupted` 结束（没做完就停了） | 同上 |
+| ● N 未读（绿） | 已正常结束（`completed` / `max-tokens`）、但本浏览器还没看过的 | `updatedAt` 对比已读水位 + `/turns` 判定 |
+
+- **没有现成字段**：DSH 不记录“某个会话是否已读”，所以已读水位由客户端持有——首次加载把当时的全部会话记为已读（否则一上来就是几十条未读），之后“看着的会话”按 `updatedAt` 前进水位，**离开时正在跑、回来已经结束**的会话由 running→false 这次跃迁直接记成未读。
+- **颜色来自会话自己的结局**：`turn/end` 的 `reason.kind` 决定色调——`completed`/`max-tokens` 绿、`aborted`/`interrupted` 黄、`blocked`/`error` 红。查不到（会话已离开内存）返回 `unknown`，落回绿色“未读”，不猜成别的颜色。
+- **只轮询结局**：运行数订阅 `sessions.list`，状态真变才算；已结束会话的结局每 15s 向宿主批量问一次（单次最多 24 个），页面不可见时不发。
+- **弱干扰**：11px 三级文字色；数字为 0 的那段整段隐藏，四段都为 0 时退化成一颗很淡的点（`data-idle` 0.45 透明度，hover 回到 0.95）。
+- **hover / focus 才出细节**：浮层按紧急度分区（出错 → 中断 → 运行 → 未读）列出会话标题与相对时间，点一下直接跳转；键盘 Tab 可进，Esc 关闭，`aria-label` 给出四段计数。
+- 文案进的是插件自己的 locale 命名空间（`locale.register('session-rail', {zh, en})`），跟随 GUI 语言切换；颜色全部走 `--dsw-alias-*` 别名 token，深浅色各自成立（浮层用 `bg-layer-3` 实心面，不用会透出正文字色的 `bg-overlay`）。
+
+| 深色 | 深色 + hover |
+| --- | --- |
+| ![深色](docs/header-counts-dark.png) | ![深色浮层](docs/header-counts-dark-panel.png) |
 
 ## 交互
 
@@ -34,6 +60,7 @@
 
 ```
 GET /api/session-rail/turn?sessionId=<会话 id>
+GET /api/session-rail/turns?ids=<逗号分隔，最多 24 个>   # 批量：每会话最后一个回合的结局
 GET /api/session-rail/progress?cwd=<绝对路径>&sessionId=<会话 id>
 GET /api/session-rail/changes?cwd=<绝对路径>        # 0.1.5 起无客户端使用，保留为只读诊断口
 GET /api/session-rail/sources?cwd=<绝对路径>        # 同上
@@ -86,7 +113,7 @@ npm test     # = node test/host.test.mjs && node test/client.test.cjs
 ```
 
 - `test/host.test.mjs`：自建临时 git 仓库与进度目录，覆盖 13 组断言（含 `/turn` 运行/闭合/未知会话、`/changes`、`/sources`、信标与 `/state`、传输守卫）。
-- `test/client.test.cjs`：stub React 渲染进度 tab，覆盖描述符（只有一个）、badge、运行状态卡、空态。
+- `test/client.test.cjs`：stub React 渲染进度 tab 与顶部计数，覆盖描述符（只有一个）、badge、运行状态卡、空态，以及已读水位的基线 / 跃迁 / 跳转清理与“空闲只剩一颗点”的渲染。
 
 两个测试都不碰真实工作区、不联网。
 
@@ -98,3 +125,5 @@ npm test     # = node test/host.test.mjs && node test/client.test.cjs
 - `/turn` 只看尾部 400 条事件：超长单轮（>400 个事件）时工具计数会偏小，运行状态与时长的判定不受影响。
 - `/sources` 接口（无客户端使用）：`gh` 未安装或未登录时返回首行原因，不伪造“已登录”。
 - 会话的工作目录已不存在时，命令在宿主进程目录下执行：坏 `cwd` 的 `ENOENT` 不会被误报成“gh CLI not found”。
+- 顶部计数在**新会话首屏**不显示：那页 shell 会把整条标题行收掉（`hideChrome`），只留最右角；这是宿主布局行为，插件未越权改 DOM。
+- 已读水位是按浏览器存的（`localStorage`），换浏览器 / 清站点数据会重新基线一次；子代理会话与空会话不计入两个数字。

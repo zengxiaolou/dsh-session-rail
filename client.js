@@ -35,6 +35,12 @@ window.__ModuleLoader__.load({
     /** How long to wait for dsh-better-sidebar before reporting the missing service. */
     const SERVICE_DIAGNOSTIC_MS = 8000;
 
+    /** How often the header re-asks the host how finished Sessions ended. */
+    const OUTCOME_POLL_MS = 15_000;
+
+    /** One /turns round classifies at most this many Sessions (host caps it too). */
+    const MAX_OUTCOME_IDS = 24;
+
     /** Latest locale, refreshed from the Client locale service; only affects our own labels. */
     let activeLocale = 'zh';
     const t = (zh, en) => (String(activeLocale).toLowerCase().startsWith('en') ? en : zh);
@@ -350,6 +356,529 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /* ── header counters ─────────────────────────────────────────────────
+     * The DSH header leaves the band between the Session title and the right
+     * icon cluster empty. Two numbers sit there so they stay visible on every
+     * conversation page, instead of waiting inside a sidebar tab:
+     *   running — Sessions with a live turn right now;
+     *   unread  — finished Sessions this browser has not looked at yet.
+     * DSH keeps no per-Session read marker, so this half owns one in
+     * localStorage; the Client session store stays the live source for both.
+     */
+    const HEADER_NS = 'session-rail';
+    const HEADER_TEXT = {
+      zh: {
+        running: '运行',
+        unread: '未读',
+        interrupted: '中断',
+        error: '出错',
+        idle: '没有进行中的会话，也没有未读完成',
+        panelRunning: '正在运行的会话',
+        panelUnread: '已完成、尚未查看',
+        panelInterrupted: '没做完就中断的',
+        panelError: '出问题的',
+        panelEmpty: '所有会话都已读，也没有进行中的回合',
+        openHint: '点击会话即可跳转',
+        summary: '{running} 个进行中，{unread} 个未读，{interrupted} 个中断，{error} 个出错',
+      },
+      en: {
+        running: 'live',
+        unread: 'unread',
+        interrupted: 'stopped',
+        error: 'failed',
+        idle: 'No live turns and nothing unread',
+        panelRunning: 'Running now',
+        panelUnread: 'Finished, not read',
+        panelInterrupted: 'Stopped mid-turn',
+        panelError: 'Errored',
+        panelEmpty: 'Every Session is read and nothing is running',
+        openHint: 'Click a Session to open it',
+        summary: '{running} live, {unread} unread, {interrupted} stopped, {error} failed',
+      },
+    };
+
+    /** Bound locale translator for HEADER_NS; null keeps the inline dictionary. */
+    let headerTranslate = null;
+
+    function headerT(key, params) {
+      if (headerTranslate !== null) {
+        try {
+          return headerTranslate(key, params);
+        } catch {
+          headerTranslate = null;
+        }
+      }
+      const dict = /^en/i.test(String(activeLocale)) ? HEADER_TEXT.en : HEADER_TEXT.zh;
+      const template = dict[key] ?? key;
+      if (!params) return template;
+      return template.replace(/\{(\w+)\}/g, (match, name) => (name in params ? String(params[name]) : match));
+    }
+
+    /** Read watermark: `sessions` is the highest activity the user has read per Session. */
+    const SEEN_KEY = 'dsh-session-rail:seen:v1';
+
+    function readSeenStore() {
+      try {
+        const raw = window?.localStorage?.getItem?.(SEEN_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || parsed.v !== 1 || typeof parsed.sessions !== 'object' || parsed.sessions === null) return null;
+        return {
+          v: 1,
+          sessions: parsed.sessions,
+          finished: parsed.finished && typeof parsed.finished === 'object' ? parsed.finished : {},
+          live: Array.isArray(parsed.live) ? parsed.live.filter((id) => typeof id === 'string') : [],
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    function writeSeenStore(store) {
+      try {
+        window?.localStorage?.setItem?.(SEEN_KEY, JSON.stringify(store));
+      } catch {
+        // A browser that refuses storage keeps counting for this page only.
+      }
+    }
+
+    /**
+     * Reconcile the watermark with the current Session rows.
+     * @param rows - `{ id, at, running }` for every root Session the list knows.
+     * @param store - previous watermark; null on the first run in this browser.
+     * @param currentId - Session on screen; having it open counts as reading it.
+     * @param now - clock in milliseconds, injectable for tests.
+     * @returns the store to persist (the same object when nothing changed).
+     */
+    function reconcileSeen(rows, store, currentId, now) {
+      const stamp = Number.isFinite(now) ? now : Date.now();
+      const live = [];
+      for (const row of rows) if (row.running) live.push(row.id);
+      if (!store) {
+        const sessions = {};
+        for (const row of rows) sessions[row.id] = Math.max(sessions[row.id] ?? 0, row.at);
+        return { v: 1, sessions, finished: {}, live };
+      }
+      const sessions = { ...(store.sessions ?? {}) };
+      const finished = { ...(store.finished ?? {}) };
+      const wasLive = Array.isArray(store.live) ? store.live : [];
+      let changed = false;
+      // A Session that stopped running has just finished a turn. Unless it is
+      // the one on screen, that result is unread until the user opens it.
+      for (const id of wasLive) {
+        if (live.includes(id) || id === currentId) continue;
+        finished[id] = Math.max(finished[id] ?? 0, stamp);
+        changed = true;
+      }
+      if (currentId) {
+        const row = rows.find((entry) => entry.id === currentId);
+        const at = Math.max(row ? row.at : 0, finished[currentId] ?? 0);
+        if ((sessions[currentId] ?? 0) < at) {
+          sessions[currentId] = at;
+          changed = true;
+        }
+        if (finished[currentId] !== undefined) {
+          delete finished[currentId];
+          changed = true;
+        }
+      }
+      const liveChanged = live.length !== wasLive.length || live.some((id, index) => id !== wasLive[index]);
+      if (!changed && !liveChanged) return store;
+      return { v: 1, sessions, finished, live };
+    }
+
+    /**
+     * @param rows - root Sessions from the Client session store.
+     * @param store - persisted watermark, or null while the baseline is pending.
+     * @param currentId - Session on screen; it is being read, so it is not unread.
+     * @param outcomes - host verdict per Session id: done / interrupted / error.
+     * @returns the counts the header shows, split by how the turn ended.
+     */
+    function readCounts(rows, store, currentId, outcomes) {
+      const marks = store?.sessions ?? {};
+      const finished = store?.finished ?? {};
+      const running = [];
+      const unread = [];
+      const interrupted = [];
+      const error = [];
+      for (const row of rows) {
+        if (row.running) {
+          running.push(row);
+          continue;
+        }
+        if (row.id === currentId) continue;
+        const seenAt = marks[row.id] ?? 0;
+        const finishedAt = finished[row.id] ?? 0;
+        if (row.at > seenAt || finishedAt > seenAt) {
+          const entry = { ...row, at: Math.max(row.at, finishedAt) };
+          const tone = outcomes?.[row.id]?.state;
+          if (tone === 'interrupted') interrupted.push(entry);
+          else if (tone === 'error') error.push(entry);
+          else unread.push(entry);
+        }
+      }
+      const byNewest = (left, right) => right.at - left.at;
+      unread.sort(byNewest);
+      interrupted.sort(byNewest);
+      error.sort(byNewest);
+      return { running, unread, interrupted, error, ready: store !== null };
+    }
+
+    /**
+     * Root Sessions from the Client session store; subagent children and blank
+     * Sessions are not conversations of their own, so they never count.
+     */
+    function readSessionRows(sessions) {
+      const list = sessions?.list;
+      const state = typeof list?.getSnapshot === 'function' ? list.getSnapshot() : null;
+      const rows = [];
+      for (const id of Array.isArray(state?.ids) ? state.ids : []) {
+        const row = state?.byId?.[id];
+        if (!row || row.origin === 'subagent' || row.blank === true) continue;
+        rows.push({
+          id: String(row.id ?? id),
+          at: Number(row.updatedAt) || 0,
+          running: row.running === true,
+          title: String(row.displayTitle || row.title || id),
+        });
+      }
+      return { list, rows };
+    }
+
+    function useLocaleRevision(ctx) {
+      const [, setRevision] = useState(0);
+      useEffect(() => {
+        let locale;
+        try {
+          locale = ctx && typeof ctx.get === 'function' ? ctx.get('locale') : undefined;
+        } catch {
+          locale = undefined;
+        }
+        if (!locale || typeof locale.subscribe !== 'function') return undefined;
+        const dispose = locale.subscribe(() => {
+          readLocale(locale);
+          setRevision((value) => value + 1);
+        });
+        return typeof dispose === 'function' ? dispose : undefined;
+      }, [ctx]);
+    }
+
+    /**
+     * Host verdict for every finished Session the chip can colour: whether its
+     * last turn completed, was interrupted, or failed. Live Sessions do not need
+     * this — the store already says they are running.
+     */
+    function useTurnOutcomes(rows) {
+      const [outcomes, setOutcomes] = useState({});
+      const ids = rows
+        .filter((row) => !row.running)
+        .slice()
+        .sort((left, right) => right.at - left.at)
+        .slice(0, MAX_OUTCOME_IDS)
+        .map((row) => row.id)
+        .sort();
+      const key = ids.join(',');
+
+      useEffect(() => {
+        if (!key) return undefined;
+        let cancelled = false;
+        let inFlight = false;
+        const load = async () => {
+          if (inFlight) return;
+          inFlight = true;
+          try {
+            const data = await getJson('/turns', { ids: key });
+            if (!cancelled && data?.turns) setOutcomes(data.turns);
+          } catch {
+            // No verdict only costs the colour: everything falls back to "unread".
+          } finally {
+            inFlight = false;
+          }
+        };
+        load();
+        const timer = setInterval(load, OUTCOME_POLL_MS);
+        return () => {
+          cancelled = true;
+          clearInterval(timer);
+        };
+      }, [key]);
+
+      return outcomes;
+    }
+
+    /** Live counts, driven by the session store's own subscription: no polling. */
+    function useHeaderCounts(ctx, currentId) {
+      const [rows, setRows] = useState([]);
+      const [store, setStore] = useState(() => readSeenStore());
+
+      useEffect(() => {
+        let sessions;
+        try {
+          sessions = ctx && typeof ctx.get === 'function' ? ctx.get('sessions') : undefined;
+        } catch {
+          sessions = undefined;
+        }
+        const { list, rows: initial } = readSessionRows(sessions);
+        setRows(initial);
+        if (!list || typeof list.subscribe !== 'function') return undefined;
+        const read = () => setRows(readSessionRows(sessions).rows);
+        const dispose = list.subscribe(read);
+        return () => {
+          try {
+            if (typeof dispose === 'function') dispose();
+          } catch {
+            // Disposal is best effort; a dead store simply stops calling back.
+          }
+        };
+      }, [ctx]);
+
+      useEffect(() => {
+        if (!rows.length) return;
+        const next = reconcileSeen(rows, store, currentId, Date.now());
+        if (next !== store) {
+          writeSeenStore(next);
+          setStore(next);
+        }
+      }, [rows, store, currentId]);
+
+      return readCounts(rows, store, currentId, useTurnOutcomes(rows));
+    }
+
+    /** Inline styles for the header chip and its hover panel (theme alias tokens only). */
+    const HDR = {
+      wrap: { position: 'relative', display: 'inline-flex', alignItems: 'center', WebkitAppRegion: 'no-drag' },
+      chip: {
+        appearance: 'none', WebkitAppearance: 'none', margin: 0, padding: '0 6px', height: '22px',
+        display: 'inline-flex', alignItems: 'center', gap: '9px',
+        background: 'transparent', border: '1px solid transparent', borderRadius: '7px',
+        color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap',
+        font: 'var(--dsw-font-xxxs-11, 11px/14px inherit)',
+      },
+      segment: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
+      dot: { width: '6px', height: '6px', borderRadius: '999px', flex: 'none', display: 'inline-block' },
+      number: {
+        color: 'var(--dsw-alias-label-primary, inherit)',
+        font: 'var(--dsw-font-xxs-strong-12, 500 11px/14px inherit)',
+        fontVariantNumeric: 'tabular-nums',
+      },
+      label: { color: 'var(--dsw-alias-label-tertiary, #8a8a8a)' },
+      panelWrap: { position: 'fixed', zIndex: 60, paddingTop: '6px' },
+      panel: {
+        width: '268px', maxWidth: '72vw', boxSizing: 'border-box',
+        padding: '8px', display: 'flex', flexDirection: 'column', gap: '6px',
+        // Floating menu over a live transcript: opaque, never glass. `bg-overlay`
+        // renders translucent here (measured #394762 on a #222731 header), which is
+        // what made the panel look washed out; `bg-layer-3` is a solid surface —
+        // #353638 in the dark theme, #ffffff in light — one step above the page
+        // (#252527) and level with the shell's own menu fill (#303136).
+        background: 'var(--dsw-alias-bg-layer-3, #353638)',
+        border: '1px solid var(--dsw-alias-border-l3, rgba(255,255,255,.16))',
+        borderRadius: '10px', boxShadow: '0 16px 40px rgba(0,0,0,.45)',
+        color: 'var(--dsw-alias-label-primary, inherit)',
+        font: 'var(--dsw-font-xxxs-11, 11px/15px inherit)',
+      },
+      panelSection: { display: 'flex', flexDirection: 'column', gap: '1px' },
+      panelHead: {
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px',
+        padding: '2px 4px', fontSize: '10px', letterSpacing: '.04em',
+        color: 'var(--dsw-alias-label-tertiary, #8a8a8a)',
+      },
+      panelCount: { fontVariantNumeric: 'tabular-nums' },
+      row: {
+        appearance: 'none', margin: 0, padding: '3px 4px', width: '100%', boxSizing: 'border-box',
+        display: 'flex', alignItems: 'baseline', gap: '8px', minWidth: 0,
+        background: 'transparent', border: 'none', borderRadius: '6px',
+        color: 'inherit', cursor: 'pointer', textAlign: 'left',
+        font: 'var(--dsw-font-xxxs-11, 11px/15px inherit)',
+      },
+      rowTitle: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+      rowMeta: { flex: 'none', color: 'var(--dsw-alias-label-tertiary, #8a8a8a)', fontVariantNumeric: 'tabular-nums' },
+      panelFoot: { padding: '2px 4px 0', fontSize: '10px', color: 'var(--dsw-alias-label-caption, #8a8a8a)' },
+    };
+
+    const HEADER_CSS = `
+      .sr-hdr-chip { transition: background-color .15s ease, opacity .15s ease; }
+      .sr-hdr-chip:hover, .sr-hdr-chip:focus-visible { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16)); }
+      .sr-hdr-chip:focus-visible { outline: 1px solid #4b8bf5; outline-offset: 1px; }
+      .sr-hdr-chip[data-idle="true"] { opacity: .45; }
+      .sr-hdr-chip[data-idle="true"]:hover, .sr-hdr-chip[data-idle="true"]:focus-visible { opacity: .95; }
+      .sr-hdr-live { animation: sr-hdr-pulse 2.4s ease-in-out infinite; }
+      @keyframes sr-hdr-pulse { 0%, 100% { opacity: .35 } 50% { opacity: 1 } }
+      @media (prefers-reduced-motion: reduce) { .sr-hdr-live { animation: none; opacity: .85 } }
+      .sr-hdr-row { border-radius: 6px; }
+      .sr-hdr-row:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16)); }
+    `;
+
+    /**
+     * Two live counts in the header band: turns in flight, and finished
+     * Sessions this browser has not read. Idle degrades to a single faint dot;
+     * hover or keyboard focus reveals the per-Session detail.
+     */
+    function HeaderCounts(props) {
+      const rail = props?.rail ?? {};
+      const ctx = rail.ctx ?? null;
+      const currentId = String(rail.currentId || props?.sessionId || props?.scope?.sessionId || '');
+      useLocaleRevision(ctx);
+      const counts = useHeaderCounts(ctx, currentId);
+      const [open, setOpen] = useState(false);
+      const [anchor, setAnchor] = useState(null);
+
+      if (!counts.ready) return null;
+
+      const runningCount = counts.running.length;
+      const unreadCount = counts.unread.length;
+      const interruptedCount = counts.interrupted.length;
+      const errorCount = counts.error.length;
+      const idle = runningCount + unreadCount + interruptedCount + errorCount === 0;
+      const summary = idle
+        ? headerT('idle')
+        : headerT('summary', {
+            running: runningCount,
+            unread: unreadCount,
+            interrupted: interruptedCount,
+            error: errorCount,
+          });
+
+      const place = (event) => {
+        const rect = event?.currentTarget?.getBoundingClientRect?.();
+        if (!rect) {
+          setAnchor({ top: 56, right: 24 });
+          return;
+        }
+        setAnchor({
+          top: Math.round(rect.bottom + 6),
+          right: Math.max(8, Math.round(window.innerWidth - rect.right)),
+        });
+      };
+
+      const openSession = (id) => {
+        try {
+          const workspace = ctx && typeof ctx.get === 'function' ? ctx.get('uiWorkspace') : undefined;
+          if (workspace && typeof workspace.openSession === 'function') {
+            workspace.openSession(id);
+            setOpen(false);
+          }
+        } catch {
+          // Navigation is optional; the counts stay readable without it.
+        }
+      };
+
+      const jump = () => {
+        // Most urgent first: a failed turn, then a stopped one, then unread work.
+        const target = counts.error[0] ?? counts.interrupted[0] ?? counts.unread[0] ?? counts.running[0];
+        if (target) openSession(target.id);
+      };
+
+      /**
+       * One dot + number + label per state. Blue is work in flight, green is
+       * finished and waiting to be read, amber stopped short, red broke — the
+       * same vocabulary the shell uses for its own state dots.
+       */
+      const TONES = [
+        { key: 'running', count: runningCount, label: 'running', pulse: true, tone: 'var(--dsw-alias-state-business-primary, #4b8bf5)' },
+        { key: 'error', count: errorCount, label: 'error', tone: 'var(--dsw-alias-state-error-primary, #e05a4f)' },
+        { key: 'interrupted', count: interruptedCount, label: 'interrupted', tone: 'var(--dsw-alias-state-warn-primary, #b08a2e)' },
+        { key: 'unread', count: unreadCount, label: 'unread', tone: 'var(--dsw-alias-state-success-primary, #3fae6a)' },
+      ];
+
+      const segments = [];
+      for (const item of TONES) {
+        if (item.count === 0) continue;
+        segments.push(h('span', { key: item.key, style: HDR.segment },
+          h('span', {
+            key: 'dot',
+            className: item.pulse ? 'sr-hdr-live' : undefined,
+            style: { ...HDR.dot, background: item.tone },
+          }),
+          h('span', { key: 'num', style: HDR.number }, String(item.count)),
+          h('span', { key: 'label', style: HDR.label }, headerT(item.label)),
+        ));
+      }
+      if (segments.length === 0) {
+        segments.push(h('span', {
+          key: 'idle',
+          style: { ...HDR.dot, background: 'var(--dsw-alias-label-dimmed, #8a8a8a)' },
+        }));
+      }
+
+      const SECTIONS = [
+        { key: 'error', list: counts.error, label: 'panelError' },
+        { key: 'interrupted', list: counts.interrupted, label: 'panelInterrupted' },
+        { key: 'running', list: counts.running, label: 'panelRunning' },
+        { key: 'unread', list: counts.unread, label: 'panelUnread' },
+      ];
+
+      const section = ({ key, list, label }) => {
+        const rows = list.slice(0, 6).map((row) => h('button', {
+          key: row.id,
+          type: 'button',
+          className: 'sr-hdr-row',
+          style: HDR.row,
+          title: row.title,
+          onClick: () => openSession(row.id),
+        },
+          h('span', { key: 'title', style: HDR.rowTitle }, row.title),
+          key === 'running' ? null : h('span', { key: 'meta', style: HDR.rowMeta }, relativeTime(row.at)),
+        ));
+        return h('div', { key, style: HDR.panelSection },
+          h('div', { style: HDR.panelHead },
+            h('span', null, headerT(label)),
+            h('span', { style: HDR.panelCount }, String(list.length)),
+          ),
+          ...rows,
+          list.length > 6
+            ? h('div', { key: 'more', style: { ...HDR.rowMeta, padding: '0 4px' } }, `+${String(list.length - 6)}`)
+            : null,
+        );
+      };
+
+      return h('span', {
+        style: HDR.wrap,
+        onMouseEnter: (event) => {
+          place(event);
+          setOpen(true);
+        },
+        onMouseLeave: () => setOpen(false),
+        onFocus: (event) => {
+          place(event);
+          setOpen(true);
+        },
+        onBlur: (event) => {
+          if (!event.currentTarget.contains?.(event.relatedTarget)) setOpen(false);
+        },
+        onKeyDown: (event) => {
+          if (event.key === 'Escape') setOpen(false);
+        },
+      },
+        h('style', null, HEADER_CSS),
+        h('button', {
+          type: 'button',
+          className: 'sr-hdr-chip',
+          'data-idle': idle ? 'true' : 'false',
+          style: HDR.chip,
+          'aria-label': summary,
+          'aria-expanded': open ? 'true' : 'false',
+          'aria-haspopup': 'dialog',
+          'aria-controls': 'session-rail-header-panel',
+          title: summary,
+          onClick: jump,
+        }, ...segments),
+        open && anchor
+          ? h('div', {
+            id: 'session-rail-header-panel',
+            style: { ...HDR.panelWrap, top: `${anchor.top}px`, right: `${anchor.right}px` },
+            role: 'dialog',
+            'aria-label': summary,
+          },
+            h('div', { style: HDR.panel },
+              SECTIONS.filter((entry) => entry.list.length > 0).map(section),
+              idle ? h('div', { style: HDR.panelFoot }, headerT('panelEmpty')) : null,
+              idle ? null : h('div', { style: HDR.panelFoot }, headerT('openHint')),
+            ))
+          : null,
+      );
+    }
+
     function icon(paths) {
       return (size) => h('svg', {
         width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
@@ -374,6 +903,8 @@ window.__ModuleLoader__.load({
     ];
 
     return {
+      /** Pure helpers exposed for the offline client test; the loader only reads `apply`. */
+      internals: { reconcileSeen, readCounts, readSessionRows, HeaderCounts, HEADER_TEXT, SEEN_KEY },
       apply(ctx) {
         let locale;
         try {
@@ -385,6 +916,46 @@ window.__ModuleLoader__.load({
         if (locale && typeof locale.subscribe === 'function') {
           ctx.effect(() => locale.subscribe(() => readLocale(locale)));
         }
+        // Header copy lives in the plugin's own locale namespace, so the GUI's
+        // language switch reaches it without a reload.
+        if (locale && typeof locale.register === 'function') {
+          ctx.effect(() => locale.register(HEADER_NS, HEADER_TEXT));
+        }
+        if (locale && typeof locale.bind === 'function') {
+          headerTranslate = locale.bind(HEADER_NS);
+        }
+
+        /**
+         * Header counters: `conversation.session.header.utilities` is the band
+         * the empty space belongs to — the right-aligned controls sit after it,
+         * the Session title before it, and the shell re-renders it on every
+         * conversation page (all view tabs share this header).
+         */
+        const registerHeader = (scoped) => {
+          let slots;
+          try {
+            slots = typeof scoped.get === 'function' ? scoped.get('slots') : scoped.slots;
+          } catch {
+            slots = undefined;
+          }
+          if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
+            report('header', {});
+            console.warn('[session-rail] slots 服务未出现，顶部会话计数未注册。');
+            return;
+          }
+          scoped.effect(() => slots.inject('conversation.session.header.utilities', () => slots.register({
+            name: 'conversation.session.header.utilities',
+            id: 'session-rail:header-counts',
+            order: -10,
+            inject: (sessionId) => ({
+              rail: {
+                ctx: scoped,
+                currentId: sessionId === undefined || sessionId === null ? '' : String(sessionId),
+              },
+            }),
+          }, HeaderCounts)));
+          report('header', { tabs: 'header-counts' });
+        };
 
         const registerAll = (scoped) => {
           const service = typeof scoped.get === 'function' ? scoped.get('betterSidebar') : scoped.betterSidebar;
@@ -402,6 +973,9 @@ window.__ModuleLoader__.load({
           // Non-blocking: the tab types appear as soon as dsh-better-sidebar's
           // client half publishes its service, which may be later than this apply.
           ctx.inject(['betterSidebar'], registerAll);
+          // The header seat needs the slot registry and the session list; both
+          // belong to core client packages, but neither is guaranteed at apply time.
+          ctx.inject(['slots', 'sessions'], registerHeader);
           setTimeout(() => {
             try {
               if (!ctx.get('betterSidebar')) {
@@ -413,6 +987,7 @@ window.__ModuleLoader__.load({
           }, SERVICE_DIAGNOSTIC_MS);
         } else {
           registerAll(ctx);
+          registerHeader(ctx);
         }
       },
     };

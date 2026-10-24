@@ -69,10 +69,17 @@ const sandboxFetch = (url) => {
   return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
 };
 
+const localStore = new Map();
+
 function loadModule() {
   let loaded;
   const sandbox = {
     window: {
+      localStorage: {
+        getItem: (key) => (localStore.has(key) ? localStore.get(key) : null),
+        setItem: (key, value) => { localStore.set(key, String(value)); },
+        removeItem: (key) => { localStore.delete(key); },
+      },
       __ModuleLoader__: {
         load: ({ id, factory }) => {
           loaded = { id, mod: factory((name) => {
@@ -168,7 +175,121 @@ async function mount(component, props) {
   assert.match(out.text, /dsh-progress run --task/);
   assert.equal(tabs[0].badge(ctx, baseProps.scope, {}), null);
 
-  console.log('client tabs: 4/4 groups passed');
+  // 5. header counters: the read watermark decides what "unread" means
+  const { internals } = mod;
+  const headRows = [
+    { id: 'a', at: 100, running: false },
+    { id: 'b', at: 200, running: true },
+    { id: 'c', at: 300, running: false },
+  ];
+  const baseline = internals.reconcileSeen(headRows, null, 'a', 1_000);
+  // The module runs in a vm realm, so compare plain JSON, not prototypes.
+  assert.equal(JSON.stringify(baseline.sessions), JSON.stringify({ a: 100, b: 200, c: 300 }), 'first run baselines every Session as read');
+  assert.equal(JSON.stringify(baseline.live), JSON.stringify(['b']));
+  let head = internals.readCounts(headRows, baseline, 'a');
+  assert.equal(head.ready, true);
+  assert.equal(head.running.length, 1);
+  assert.equal(head.unread.length, 0);
+
+  // b's turn ends while another Session (a) is on screen → b becomes unread
+  const finished = headRows.map((row) => (row.id === 'b' ? { ...row, running: false, at: 400 } : row));
+  const afterFinish = internals.reconcileSeen(finished, baseline, 'a', 1_000);
+  assert.equal(afterFinish === baseline, false, 'a finished turn changes the store');
+  head = internals.readCounts(finished, afterFinish, 'a');
+  assert.equal(head.running.length, 0);
+  assert.equal(JSON.stringify(head.unread.map((row) => row.id)), JSON.stringify(['b']));
+
+  // opening b clears it, and the watermark never moves backwards
+  const afterRead = internals.reconcileSeen(finished, afterFinish, 'b', 1_100);
+  head = internals.readCounts(finished, afterRead, 'b');
+  assert.equal(head.unread.length, 0);
+  assert.equal(afterRead.finished.b, undefined);
+  assert.equal(afterRead.sessions.b, 1_000, 'the watermark covers the finish that triggered it');
+  assert.equal(internals.reconcileSeen(finished, afterRead, 'b', 1_200) === afterRead, true, 'no write when nothing changed');
+
+  // subagent children and blank Sessions are not conversations of their own
+  const listed = internals.readSessionRows({
+    list: {
+      getSnapshot: () => ({
+        ids: ['root', 'child', 'blank'],
+        byId: {
+          root: { id: 'root', displayTitle: '主会话', updatedAt: 10, running: true },
+          child: { id: 'child', displayTitle: '子代理', updatedAt: 11, running: true, origin: 'subagent' },
+          blank: { id: 'blank', displayTitle: '新会话', updatedAt: 12, running: false, blank: true },
+        },
+      }),
+    },
+  });
+  assert.equal(JSON.stringify(listed.rows.map((row) => row.id)), JSON.stringify(['root']));
+  assert.equal(internals.HEADER_TEXT.en.unread, 'unread');
+
+  // 6. header chip renders from the session store: idle degrades to one faint dot
+  const makeCtx = (rows) => ({
+    get: (name) => (name === 'sessions'
+      ? { list: { getSnapshot: () => ({ ids: rows.map((row) => row.id), byId: Object.fromEntries(rows.map((row) => [row.id, row])) }), subscribe: () => () => {} } }
+      : undefined),
+  });
+  const idleRows = [{ id: 'only', displayTitle: '只有一个', updatedAt: 500, running: false }];
+  localStore.clear();
+  states.delete(internals.HeaderCounts);
+  // The stub runs effects once per mount, so the second pass is the commit
+  // React would make after the store subscription delivered its rows.
+  await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(idleRows), currentId: 'only' } });
+  let chip = await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(idleRows), currentId: 'only' } });
+  assert.equal(chip.text, '', 'an idle chip shows a dot, not a number');
+  assert.match(JSON.stringify(chip.nodes.find((node) => node.props && node.props['aria-label'])?.props || {}), /没有进行中/);
+
+  // A turn that ends while another Session is on screen becomes unread: the
+  // first pass baselines both Sessions as running, the second drops one.
+  states.delete(internals.HeaderCounts);
+  localStore.clear();
+  const runningRows = [
+    { id: 'mine', displayTitle: '当前会话', updatedAt: 900, running: true },
+    { id: 'other', displayTitle: '别的会话', updatedAt: 800, running: true },
+  ];
+  await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(runningRows), currentId: 'mine' } });
+  await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(runningRows), currentId: 'mine' } });
+  let busy = await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(runningRows), currentId: 'mine' } });
+  assert.match(busy.text, /2/, 'both live Sessions are counted');
+  assert.doesNotMatch(busy.text, /未读/);
+
+  const finishedRows = [
+    { id: 'mine', displayTitle: '当前会话', updatedAt: 900, running: true },
+    { id: 'other', displayTitle: '别的会话', updatedAt: 950, running: false },
+  ];
+  await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(finishedRows), currentId: 'mine' } });
+  busy = await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(finishedRows), currentId: 'mine' } });
+  assert.match(busy.text, /运行/);
+  assert.match(busy.text, /未读/, 'the Session that finished off screen is unread');
+
+  // 7. how a turn ended decides the colour: done / stopped / failed are separate
+  const toneRows = [
+    { id: 'done', at: 100, running: false },
+    { id: 'stopped', at: 200, running: false },
+    { id: 'failed', at: 300, running: false },
+    { id: 'live', at: 400, running: true },
+  ];
+  // A watermark below every row: all three finished Sessions are unread.
+  const toneStore = { v: 1, sessions: { done: 0, stopped: 0, failed: 0, live: 0 }, finished: {}, live: [] };
+  const tones = internals.readCounts(toneRows, toneStore, '', {
+    done: { state: 'done' },
+    stopped: { state: 'interrupted' },
+    failed: { state: 'error' },
+    live: { state: 'running' },
+  });
+  assert.equal(JSON.stringify(tones.running.map((row) => row.id)), JSON.stringify(['live']));
+  assert.equal(JSON.stringify(tones.unread.map((row) => row.id)), JSON.stringify(['done']));
+  assert.equal(JSON.stringify(tones.interrupted.map((row) => row.id)), JSON.stringify(['stopped']));
+  assert.equal(JSON.stringify(tones.error.map((row) => row.id)), JSON.stringify(['failed']));
+
+  // No verdict from the host degrades to plain "unread", never to a wrong colour.
+  const silent = internals.readCounts(toneRows, toneStore, '', undefined);
+  assert.equal(silent.interrupted.length + silent.error.length, 0);
+  assert.equal(silent.unread.length, 3);
+  assert.equal(internals.HEADER_TEXT.zh.error, '出错');
+  assert.equal(internals.HEADER_TEXT.zh.interrupted, '中断');
+
+  console.log('client tabs: 7/7 groups passed');
 })().catch((error) => {
   console.error(error);
   process.exit(1);
