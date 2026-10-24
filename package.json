@@ -1,7 +1,6 @@
 {
   "name": "dsh-session-rail",
   "version": "0.1.5",
-  "private": true,
   "type": "module",
   "description": "Progress tab for the DSH right sidebar (session turn status + long-task progress).",
   "exports": {
