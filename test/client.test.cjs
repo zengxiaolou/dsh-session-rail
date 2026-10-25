@@ -99,6 +99,7 @@ function loadModule() {
   };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8'), sandbox, { filename: 'client.js' });
+  loaded.sandbox = sandbox;
   return loaded;
 }
 
@@ -113,7 +114,7 @@ async function mount(component, props) {
 }
 
 (async () => {
-  const { id, mod } = loadModule();
+  const { id, mod, sandbox } = loadModule();
   assert.equal(id, 'dsh-session-rail');
 
   // 1. no betterSidebar service: apply must not throw and must register nothing
@@ -341,7 +342,62 @@ async function mount(component, props) {
   // The DOM painter is a no-op without a document; it must not throw.
   assert.equal(internals.paintWorkspaceBadges([{ id: 'w1', title: 'x', running: 2, question: 0 }], true), 0);
 
-  console.log('client tabs: 10/10 groups passed');
+  // 11. 顶部「● N 询问」只跟 /turns 的 state 走：答完之后同一会话回到「运行」，
+  //     橙色那段整段消失（count 为 0 时它的 span 根本不渲染）。
+  const liveRow = [{ id: 's1', displayTitle: '在跑的会话', updatedAt: 1_000, running: true }];
+  const mountHeader = async (state) => {
+    bodies['/api/session-rail/turns'] = {
+      ok: true,
+      turns: { s1: { state, kind: state === 'question' ? 'ask_user_question' : null, turn: 2 } },
+    };
+    states.delete(internals.HeaderCounts);
+    localStore.clear();
+    await mount(internals.HeaderCounts, { rail: { ctx: makeCtx(liveRow), currentId: 'elsewhere' } });
+    return mount(internals.HeaderCounts, { rail: { ctx: makeCtx(liveRow), currentId: 'elsewhere' } });
+  };
+  const parkedChip = await mountHeader('question');
+  assert.match(parkedChip.text, /询问/, 'a turn parked on a question is counted');
+  assert.doesNotMatch(parkedChip.text, /运行/, 'and is not counted as running at the same time');
+  const answeredChip = await mountHeader('running');
+  assert.doesNotMatch(answeredChip.text, /询问/, 'answered: the segment is gone from the header');
+  assert.match(answeredChip.text, /运行/, 'the same Session counts as running again');
+
+  // 12. 左栏「● N」徽标同源：同一个 verdict 决定它是橙色「等你回答」还是蓝色「在跑」，
+  //     两者都没有时把已有徽标从 DOM 里摘掉（替身 document，不需要真浏览器）。
+  const paintCase = (outcomes, running = true) => {
+    const node = {
+      removed: false,
+      innerHTML: '',
+      attributes: {},
+      style: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
+      remove() { this.removed = true; },
+    };
+    sandbox.document = {
+      querySelectorAll: () => [{ getAttribute: () => 'workspace:w1', querySelector: () => node }],
+      createElement: () => node,
+    };
+    const rollup = internals.rollupByWorkspace(
+      [{ id: 's1', running }],
+      [{ id: 'w1', title: '探索', sessionIds: ['s1'] }],
+      outcomes,
+    );
+    const painted = internals.paintWorkspaceBadges(rollup, true);
+    return { node, painted, rollup };
+  };
+  const askBadge = paintCase({ s1: { state: 'question' } });
+  assert.equal(askBadge.painted, 1, 'a parked Session keeps a badge');
+  assert.match(askBadge.node.attributes.title, /等你回答/, 'amber badge says it is waiting on you');
+  assert.match(askBadge.node.innerHTML, /f59e0b/, 'and it paints in the warning tone');
+  const liveBadge = paintCase({ s1: { state: 'running' } });
+  assert.equal(liveBadge.painted, 1, 'answered: the badge stays, because the Session is working');
+  assert.doesNotMatch(liveBadge.node.attributes.title, /等你回答/, 'the waiting wording is gone');
+  assert.match(liveBadge.node.innerHTML, /4176e6/, 'repainted in the running tone');
+  const idleBadge = paintCase({ s1: { state: 'done' } }, false);
+  assert.equal(idleBadge.painted, 0, 'nothing running and nothing waiting: no badge is drawn');
+  assert.equal(idleBadge.node.removed, true, 'the badge left over on the row is removed from the DOM');
+
+  console.log('client tabs: 12/12 groups passed');
 })().catch((error) => {
   console.error(error);
   process.exit(1);
