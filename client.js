@@ -382,6 +382,12 @@ window.__ModuleLoader__.load({
         panelEmpty: '所有会话都已读，也没有进行中的回合',
         openHint: '点击会话即可跳转',
         summary: '{running} 个进行中，{question} 个等你回答，{unread} 个未读，{interrupted} 个中断，{error} 个出错',
+        ignoreRow: '忽略',
+        settingsTitle: '会话计数',
+        settingsDesc: '定时任务跑完之后不再计入未读；失败或中断的仍然计入。',
+        ignoredCount: '已忽略 {count} 条',
+        ignoredNone: '已忽略 0 条',
+        clearIgnored: '清空',
       },
       en: {
         running: 'live',
@@ -398,6 +404,12 @@ window.__ModuleLoader__.load({
         panelEmpty: 'Every Session is read and nothing is running',
         openHint: 'Click a Session to open it',
         summary: '{running} live, {question} asking, {unread} unread, {interrupted} stopped, {error} failed',
+        ignoreRow: 'Ignore',
+        settingsTitle: 'Session counts',
+        settingsDesc: 'Finished scheduled-task runs stop counting as unread; failed or stopped runs still count.',
+        ignoredCount: '{count} ignored',
+        ignoredNone: 'None ignored',
+        clearIgnored: 'Clear',
       },
     };
 
@@ -444,6 +456,87 @@ window.__ModuleLoader__.load({
       } catch {
         // A browser that refuses storage keeps counting for this page only.
       }
+    }
+
+    /* ── ignored Sessions ────────────────────────────────────────────────
+     * Two layers, because they answer two different questions:
+     *   DEFAULT — every scheduled-task run is its own Session, so the unread
+     *             bucket grows by one per run and never comes back down. A run
+     *             that finished cleanly is not news; a failed or stopped one is.
+     *   EXPLICIT — "this row, I do not want to see". Written from the hover
+     *             panel, cleared from the settings row.
+     * Both only change counting: the Session stays in the sidebar and stays
+     * openable, so nothing is hidden that could still be running.
+     */
+    const AUTOMATION_PREFIX = 'dsh-automation-session-';
+    const IGNORE_KEY = 'dsh-session-rail:ignore:v1';
+
+    /** Listeners fired whenever the explicit list changes, for every surface. */
+    const ignoreListeners = new Set();
+
+    function subscribeIgnore(listener) {
+      ignoreListeners.add(listener);
+      return () => ignoreListeners.delete(listener);
+    }
+
+    function readIgnoreStore() {
+      try {
+        const raw = window?.localStorage?.getItem?.(IGNORE_KEY);
+        if (!raw) return { v: 1, sessions: [] };
+        const parsed = JSON.parse(raw);
+        const sessions = Array.isArray(parsed?.sessions)
+          ? parsed.sessions.filter((id) => typeof id === 'string' && id !== '')
+          : [];
+        return { v: 1, sessions };
+      } catch {
+        return { v: 1, sessions: [] };
+      }
+    }
+
+    function writeIgnoreStore(store) {
+      try {
+        window?.localStorage?.setItem?.(IGNORE_KEY, JSON.stringify(store));
+      } catch {
+        // Same as the watermark: no storage means only this page forgets.
+      }
+      for (const listener of [...ignoreListeners]) {
+        try {
+          listener();
+        } catch {
+          // One dead surface must not stop the others from repainting.
+        }
+      }
+    }
+
+    /** @returns the store after adding `id`; unchanged when it is already there. */
+    function ignoreSession(id) {
+      const sessionId = String(id ?? '');
+      if (!sessionId) return readIgnoreStore();
+      const store = readIgnoreStore();
+      if (store.sessions.includes(sessionId)) return store;
+      const next = { v: 1, sessions: [...store.sessions, sessionId] };
+      writeIgnoreStore(next);
+      return next;
+    }
+
+    function clearIgnoredSessions() {
+      writeIgnoreStore({ v: 1, sessions: [] });
+      return readIgnoreStore();
+    }
+
+    /** Ids to leave out of every count. */
+    function ignoredIdSet(store) {
+      return new Set(Array.isArray(store?.sessions) ? store.sessions : []);
+    }
+
+    /**
+     * A scheduled-task run that ended quietly: the Session is one run of a
+     * recurring task, so counting it as "finished, not read" would pile one per
+     * run. A run that broke or was stopped still counts — that is the signal.
+     */
+    function isQuietAutomationRun(id, tone) {
+      if (!String(id).startsWith(AUTOMATION_PREFIX)) return false;
+      return tone !== 'interrupted' && tone !== 'error';
     }
 
     /**
@@ -549,9 +642,10 @@ window.__ModuleLoader__.load({
      * @param outcomes - host verdict per Session id: running / question / done / interrupted / error.
      * @param pendingById - live "waiting on the user" ids from `uiSession.sessionStatus`,
      *                      or null/undefined to fall back to the verdict's `question`.
+     * @param ignoredById - ids the user explicitly ignored; empty/absent counts them.
      * @returns the counts the header shows, split by how the turn is going or ended.
      */
-    function readCounts(rows, store, currentId, outcomes, pendingById) {
+    function readCounts(rows, store, currentId, outcomes, pendingById, ignoredById) {
       const marks = store?.sessions ?? {};
       const finished = store?.finished ?? {};
       const running = [];
@@ -561,6 +655,9 @@ window.__ModuleLoader__.load({
       const error = [];
       for (const row of rows) {
         const tone = outcomes?.[row.id]?.state;
+        // An explicitly ignored Session is out of every count, running included:
+        // the user asked for that row to stop talking, not for it to be hidden.
+        if (ignoredById !== null && ignoredById !== undefined && ignoredById.has(row.id)) continue;
         if (row.running) {
           // A turn parked on ask_user_question is open but not working: it is
           // waiting for the user, so it must not be counted as busy.
@@ -575,6 +672,9 @@ window.__ModuleLoader__.load({
         const seenAt = marks[row.id] ?? 0;
         const finishedAt = finished[row.id] ?? 0;
         if (row.at > seenAt || finishedAt > seenAt) {
+          // A scheduled-task run that ended cleanly is not "finished, unread":
+          // one Session per run would otherwise add one forever.
+          if (isQuietAutomationRun(row.id, tone)) continue;
           const entry = { ...row, at: Math.max(row.at, finishedAt) };
           if (tone === 'interrupted') interrupted.push(entry);
           else if (tone === 'error') error.push(entry);
@@ -672,6 +772,27 @@ window.__ModuleLoader__.load({
       return outcomes;
     }
 
+    /**
+     * The explicit ignore list, kept in one place so the header, the rail badges
+     * and the settings row all re-read it when the panel writes to it.
+     */
+    function useIgnoreStore() {
+      const [store, setStore] = useState(() => readIgnoreStore());
+      useEffect(() => {
+        const read = () => setStore(readIgnoreStore());
+        read();
+        const dispose = subscribeIgnore(read);
+        return () => {
+          try {
+            dispose();
+          } catch {
+            // A dead listener only stops calling back.
+          }
+        };
+      }, []);
+      return store;
+    }
+
     /** Live counts, driven by the session store's own subscription: no polling. */
     function useHeaderCounts(ctx, currentId) {
       const [rows, setRows] = useState([]);
@@ -725,7 +846,8 @@ window.__ModuleLoader__.load({
         };
       }, [ctx]);
 
-      return readCounts(rows, store, currentId, useTurnOutcomes(rows), pendingById);
+      const ignoreStore = useIgnoreStore();
+      return readCounts(rows, store, currentId, useTurnOutcomes(rows), pendingById, ignoredIdSet(ignoreStore));
     }
 
     /** Inline styles for the header chip and its hover panel (theme alias tokens only). */
@@ -768,12 +890,22 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-label-tertiary, #8a8a8a)',
       },
       panelCount: { fontVariantNumeric: 'tabular-nums' },
-      row: {
-        appearance: 'none', margin: 0, padding: '3px 4px', width: '100%', boxSizing: 'border-box',
-        display: 'flex', alignItems: 'baseline', gap: '8px', minWidth: 0,
+      rowWrap: {
+        display: 'flex', alignItems: 'center', gap: '4px', minWidth: 0,
+        borderRadius: '6px',
+      },
+      rowOpen: {
+        appearance: 'none', margin: 0, padding: '3px 4px', flex: 1, minWidth: 0,
+        display: 'flex', alignItems: 'baseline', gap: '8px',
         background: 'transparent', border: 'none', borderRadius: '6px',
         color: 'inherit', cursor: 'pointer', textAlign: 'left',
         font: 'var(--dsw-font-xxxs-11, 11px/15px inherit)',
+      },
+      rowIgnore: {
+        appearance: 'none', margin: 0, padding: '2px 6px', flex: 'none',
+        background: 'transparent', border: '1px solid transparent', borderRadius: '6px',
+        color: 'var(--dsw-alias-label-tertiary, #8a8a8a)', cursor: 'pointer',
+        font: 'var(--dsw-font-xxxs-11, 11px/14px inherit)', whiteSpace: 'nowrap',
       },
       rowTitle: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
       rowMeta: { flex: 'none', color: 'var(--dsw-alias-label-tertiary, #8a8a8a)', fontVariantNumeric: 'tabular-nums' },
@@ -804,6 +936,14 @@ window.__ModuleLoader__.load({
         background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16));
       }
       .sr-hdr-row:focus-visible { outline: 1px solid var(--dsw-alias-state-business-primary, #4176e6); outline-offset: -1px; }
+      .sr-hdr-open:focus-visible, .sr-hdr-ignore:focus-visible {
+        outline: 1px solid var(--dsw-alias-state-business-primary, #4176e6); outline-offset: -1px;
+      }
+      /* The ignore action stays out of the way until the row is under the pointer,
+         so a list of Sessions still reads as a list of Sessions. */
+      .sr-hdr-ignore { opacity: 0; transition: opacity .12s ease; }
+      .sr-hdr-row:hover .sr-hdr-ignore, .sr-hdr-ignore:focus-visible { opacity: 1; }
+      @media (prefers-reduced-motion: reduce) { .sr-hdr-ignore { transition: none; } }
     `;
 
     /**
@@ -926,16 +1066,34 @@ window.__ModuleLoader__.load({
       ];
 
       const section = ({ key, list, label }) => {
-        const rows = list.slice(0, 6).map((row) => h('button', {
+        const rows = list.slice(0, 6).map((row) => h('div', {
           key: row.id,
-          type: 'button',
           className: 'sr-hdr-row',
-          style: HDR.row,
-          title: row.title,
-          onClick: () => openSession(row.id),
+          style: HDR.rowWrap,
         },
-          h('span', { key: 'title', style: HDR.rowTitle }, row.title),
-          key === 'running' ? null : h('span', { key: 'meta', style: HDR.rowMeta }, relativeTime(row.at)),
+          h('button', {
+            key: 'open',
+            type: 'button',
+            className: 'sr-hdr-open',
+            style: HDR.rowOpen,
+            title: row.title,
+            onClick: () => openSession(row.id),
+          },
+            h('span', { key: 'title', style: HDR.rowTitle }, row.title),
+            key === 'running' ? null : h('span', { key: 'meta', style: HDR.rowMeta }, relativeTime(row.at)),
+          ),
+          h('button', {
+            key: 'ignore',
+            type: 'button',
+            className: 'sr-hdr-ignore',
+            style: HDR.rowIgnore,
+            title: headerT('ignoreRow'),
+            'aria-label': `${headerT('ignoreRow')}：${row.title}`,
+            onClick: (event) => {
+              if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+              ignoreSession(row.id);
+            },
+          }, headerT('ignoreRow')),
         ));
         return h('div', { key, style: HDR.panelSection },
           h('div', { style: HDR.panelHead },
@@ -1039,15 +1197,17 @@ window.__ModuleLoader__.load({
      * @returns one entry per Workspace that has work right now; Workspaces with
      *          nothing running are dropped here, so the DOM never has to decide.
      */
-    function rollupByWorkspace(rows, workspaces, outcomes, pendingById) {
+    function rollupByWorkspace(rows, workspaces, outcomes, pendingById, ignoredById) {
       const byId = new Map(rows.map((row) => [row.id, row]));
       const useLive = pendingById !== null && pendingById !== undefined;
+      const ignored = ignoredById !== null && ignoredById !== undefined ? ignoredById : null;
       const out = [];
       for (const workspace of workspaces ?? []) {
         let running = 0;
         let question = 0;
         for (const sessionId of workspace?.sessionIds ?? []) {
           const id = String(sessionId);
+          if (ignored !== null && ignored.has(id)) continue;
           const verdict = outcomes?.[id]?.state;
           const waiting = useLive ? pendingById.has(id) : verdict === 'question';
           if (waiting) {
@@ -1165,6 +1325,7 @@ window.__ModuleLoader__.load({
       // Same live source as the header: the badge must drop the amber "waiting"
       // the moment the question is answered, not when the whole turn ends.
       const [pendingById, setPendingById] = useState(() => readPendingInteractions(ctx));
+      const ignoreStore = useIgnoreStore();
       useEffect(() => {
         const read = () => setPendingById(readPendingInteractions(ctx));
         read();
@@ -1181,7 +1342,7 @@ window.__ModuleLoader__.load({
       }, [ctx]);
 
       useEffect(() => {
-        const rollup = rollupByWorkspace(rows, workspaces, outcomes, pendingById);
+            const rollup = rollupByWorkspace(rows, workspaces, outcomes, pendingById, ignoredIdSet(ignoreStore));
         const enabled = workspaceBadgeEnabled();
         const paint = () => {
           try {
@@ -1193,9 +1354,53 @@ window.__ModuleLoader__.load({
         paint();
         const timer = setInterval(paint, BADGE_PAINT_MS);
         return () => clearInterval(timer);
-      }, [rows, workspaces, outcomes, pendingById]);
+      }, [rows, workspaces, outcomes, pendingById, ignoreStore]);
 
       return null;
+    }
+
+    /** Inline styles for the settings row: one line, the list lives in the panel. */
+    const SETTINGS = {
+      wrap: { display: 'flex', flexDirection: 'column', gap: '4px', padding: '2px 0' },
+      line: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 },
+      count: { font: 'var(--dsw-font-xxs-strong-12, 500 12px/18px inherit)', fontVariantNumeric: 'tabular-nums' },
+      clear: {
+        appearance: 'none', margin: 0, padding: '2px 8px',
+        background: 'transparent', border: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))',
+        borderRadius: '6px', color: 'var(--dsw-alias-label-secondary, inherit)', cursor: 'pointer',
+        font: 'var(--dsw-font-xxxs-11, 11px/14px inherit)',
+      },
+      desc: { color: 'var(--dsw-alias-label-tertiary, #8a8a8a)', font: 'var(--dsw-font-xxxs-11, 11px/15px inherit)' },
+    };
+
+    /**
+     * The settings row, deliberately one line: 「已忽略 N 条 · 清空」.
+     *
+     * The ignore list is written from the panel (one row at a time), so this
+     * surface only reports it and offers the way back. The default rule for
+     * scheduled-task runs needs no switch — that is the point of it.
+     */
+    function SettingsSection() {
+      const ignoreStore = useIgnoreStore();
+      const count = Array.isArray(ignoreStore?.sessions) ? ignoreStore.sessions.length : 0;
+      return h('div', { style: SETTINGS.wrap },
+        h('div', { key: 'line', style: SETTINGS.line },
+          h('span', { key: 'count', style: SETTINGS.count },
+            count === 0 ? headerT('ignoredNone') : headerT('ignoredCount', { count })),
+          count === 0
+            ? null
+            : h('button', {
+                key: 'clear',
+                type: 'button',
+                className: 'sr-settings-clear',
+                style: SETTINGS.clear,
+                onClick: () => {
+                  clearIgnoredSessions();
+                },
+              }, headerT('clearIgnored')),
+        ),
+        h('div', { key: 'desc', style: SETTINGS.desc }, headerT('settingsDesc')),
+      );
     }
 
     function icon(paths) {
@@ -1223,7 +1428,12 @@ window.__ModuleLoader__.load({
 
     return {
       /** Pure helpers exposed for the offline client test; the loader only reads `apply`. */
-      internals: { reconcileSeen, readCounts, readSessionRows, readPendingInteractions, HeaderCounts, HEADER_TEXT, SEEN_KEY, rollupByWorkspace, paintWorkspaceBadges, WorkspaceBadges, BADGE_ATTR, BADGE_TOGGLE_KEY },
+      internals: {
+      reconcileSeen, readCounts, readSessionRows, readPendingInteractions, HeaderCounts, HEADER_TEXT, SEEN_KEY,
+      rollupByWorkspace, paintWorkspaceBadges, WorkspaceBadges, BADGE_ATTR, BADGE_TOGGLE_KEY,
+      IGNORE_KEY, readIgnoreStore, writeIgnoreStore, ignoreSession, clearIgnoredSessions, ignoredIdSet,
+      isQuietAutomationRun, subscribeIgnore, SettingsSection, AUTOMATION_PREFIX,
+    },
       apply(ctx) {
         let locale;
         try {
@@ -1277,6 +1487,33 @@ window.__ModuleLoader__.load({
         };
 
         /**
+         * One row inside the settings page. `settings.section` is a list slot, so
+         * a host without it simply renders nothing instead of failing the boot.
+         */
+        const registerSettings = (scoped) => {
+          let slots;
+          try {
+            slots = typeof scoped.get === 'function' ? scoped.get('slots') : scoped.slots;
+          } catch {
+            slots = undefined;
+          }
+          if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
+            report('settings', {});
+            return;
+          }
+          try {
+            scoped.effect(() => slots.inject('settings.section', () => slots.register({
+              name: 'settings.section',
+              id: 'session-rail:ignored',
+              order: 62,
+              label: () => headerT('settingsTitle'),
+            }, SettingsSection)));
+          } catch {
+            report('settings', {});
+          }
+        };
+
+        /**
          * The rail badges ride on a slot the sidebar always renders, so they keep
          * working while a settings page or another panel owns the main area.
          */
@@ -1326,6 +1563,7 @@ window.__ModuleLoader__.load({
           // belong to core client packages, but neither is guaranteed at apply time.
           ctx.inject(['slots', 'sessions'], registerHeader);
           ctx.inject(['slots', 'sessions'], registerBadges);
+          ctx.inject(['slots'], registerSettings);
           setTimeout(() => {
             try {
               if (!ctx.get('betterSidebar')) {
@@ -1338,6 +1576,7 @@ window.__ModuleLoader__.load({
         } else {
           registerAll(ctx);
           registerHeader(ctx);
+          registerSettings(ctx);
         }
       },
     };

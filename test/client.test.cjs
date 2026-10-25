@@ -463,7 +463,99 @@ async function mount(component, props) {
   const viaReflect = internals.readPendingInteractions(reflectCtx);
   assert.equal(viaReflect.has('s1'), true, 'the non-strict service read still finds the live store');
 
-  console.log('client tabs: 13/13 groups passed');
+  // 14. 忽略：默认放过已完成的定时任务，显式忽略连运行中的也不算
+  const seenStore = { v: 1, sessions: {}, finished: {}, live: [] };
+  const auto = (id, running = false) => ({ id, at: 5_000, running, title: id });
+  const autoId = `${internals.AUTOMATION_PREFIX}run-1`;
+  const manualId = 'session-manual';
+  const rowsMix = [auto(autoId), auto(manualId), auto(`${internals.AUTOMATION_PREFIX}boom`)];
+  const verdicts = {
+    [autoId]: { state: 'done' },
+    [manualId]: { state: 'done' },
+    [`${internals.AUTOMATION_PREFIX}boom`]: { state: 'error' },
+  };
+  let mix = internals.readCounts(rowsMix, seenStore, '', verdicts, null);
+  assert.equal(JSON.stringify(mix.unread.map((row) => row.id)), JSON.stringify([manualId]), 'a finished scheduled run is not unread; a manual Session still is');
+  assert.equal(JSON.stringify(mix.error.map((row) => row.id)), JSON.stringify([`${internals.AUTOMATION_PREFIX}boom`]), 'a failed scheduled run still counts as an error');
+  const stoppedId = `${internals.AUTOMATION_PREFIX}stopped`;
+  mix = internals.readCounts([auto(stoppedId)], seenStore, '', { [stoppedId]: { state: 'interrupted' } }, null);
+  assert.equal(JSON.stringify(mix.interrupted.map((row) => row.id)), JSON.stringify([stoppedId]), 'a stopped scheduled run still counts as interrupted');
+  mix = internals.readCounts([auto(autoId, true)], seenStore, '', { [autoId]: { state: 'running' } }, null);
+  assert.equal(JSON.stringify(mix.running.map((row) => row.id)), JSON.stringify([autoId]), 'a scheduled run still running is still counted as running');
+  assert.equal(internals.isQuietAutomationRun(manualId, 'done'), false, 'the default rule is only for scheduled runs');
+  assert.equal(internals.isQuietAutomationRun(autoId, 'error'), false, 'a failed run is never quiet');
+
+  // 显式忽略：所有分桶都不再算它，包括运行中的那一桶
+  const ignored = new Set([manualId, autoId]);
+  let ignoredCounts = internals.readCounts(rowsMix, seenStore, '', verdicts, null, ignored);
+  assert.equal(ignoredCounts.unread.length, 0, 'an ignored finished Session leaves the unread bucket');
+  ignoredCounts = internals.readCounts([auto(autoId, true)], seenStore, '', {}, null, ignored);
+  assert.equal(ignoredCounts.running.length, 0, 'an ignored running Session leaves the running bucket too');
+  const wsIgnored = internals.rollupByWorkspace([auto(autoId, true)], [{ id: 'w1', title: '探索', sessionIds: [autoId] }], {}, null, ignored);
+  assert.equal(wsIgnored.length, 0, 'and it stops painting a workspace badge');
+  assert.equal(
+    internals.rollupByWorkspace([auto(autoId, true)], [{ id: 'w1', title: '探索', sessionIds: [autoId] }], {}, null, new Set())[0].running,
+    1,
+    'without the ignore set the badge is unchanged',
+  );
+
+  // 清单：写入 → 订阅回调 → 读出 → 清空
+  localStore.delete(internals.IGNORE_KEY);
+  let notified = 0;
+  const stop = internals.subscribeIgnore(() => { notified += 1; });
+  assert.equal(internals.readIgnoreStore().sessions.length, 0, 'no key means an empty list');
+  internals.ignoreSession(manualId);
+  internals.ignoreSession(manualId);
+  assert.equal(notified, 1, 'the second write is a no-op: no duplicate id, no second notify');
+  assert.equal(JSON.stringify(internals.readIgnoreStore().sessions), JSON.stringify([manualId]), 'one id, written once');
+  internals.ignoreSession(autoId);
+  assert.equal(internals.readIgnoreStore().sessions.length, 2);
+  internals.clearIgnoredSessions();
+  assert.equal(internals.readIgnoreStore().sessions.length, 0, 'clear empties the list');
+  stop();
+  localStore.set(internals.IGNORE_KEY, 'not json');
+  assert.equal(internals.readIgnoreStore().sessions.length, 0, 'a corrupt key degrades to empty instead of throwing');
+
+  // 设置区那一行：有 N 条时带“清空”，0 条时没有按钮
+  const renderOnce = (component, props) => {
+    collected = [];
+    return { text: render(React.createElement(component, props)), nodes: collected };
+  };
+  localStore.set(internals.IGNORE_KEY, JSON.stringify({ v: 1, sessions: ['a', 'b'] }));
+  const setWith = await mount(internals.SettingsSection, {});
+  assert.match(setWith.text, /已忽略 2 条/, 'the settings row reports the count');
+  assert.match(setWith.text, /清空/, 'and offers the way back');
+  localStore.set(internals.IGNORE_KEY, JSON.stringify({ v: 1, sessions: [] }));
+  states.delete(internals.SettingsSection);
+  const setEmpty = await mount(internals.SettingsSection, {});
+  assert.match(setEmpty.text, /已忽略 0 条/);
+  assert.doesNotMatch(setEmpty.text, /清空/, 'nothing to clear: no button');
+
+  // 注册：settings.section 拿到的是这一行，且槽位契约是 list 的 id/order/label
+  const registered = [];
+  const slotsStub = {
+    inject: (name, cb) => cb(),
+    register: (entry, component) => { registered.push({ entry, component }); return () => {}; },
+  };
+  const settingsCtx = {
+    effect: (fn) => fn(),
+    get: (name) => (name === 'slots' ? slotsStub : undefined),
+    inject: (keys, cb) => cb(settingsCtx),
+  };
+  mod.apply(settingsCtx);
+  const settingsEntry = registered.find((item) => item.entry.name === 'settings.section');
+  assert.ok(settingsEntry, 'the settings section is registered when the slot exists');
+  assert.equal(settingsEntry.entry.id, 'session-rail:ignored');
+  assert.equal(typeof settingsEntry.entry.order, 'number');
+  assert.equal(settingsEntry.component, internals.SettingsSection);
+  assert.equal(typeof settingsEntry.entry.label(), 'string');
+
+  // 浮层每行都有“忽略”动作（按钮存在于此，点击行为即上面测过的 ignoreSession）
+  const sourceText = fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8');
+  assert.equal((sourceText.match(/className: 'sr-hdr-ignore'/g) || []).length, 1, 'one ignore button class in the row renderer');
+  assert.equal((sourceText.match(/ignoreSession\(row\.id\)/g) || []).length, 1, 'and one place that writes the id');
+
+  console.log('client tabs: 14/14 groups passed');
 })().catch((error) => {
   console.error(error);
   process.exit(1);
