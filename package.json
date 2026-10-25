@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-rail",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "type": "module",
   "description": "Session status at a glance for the DSH Web UI: five-state header counters (running / asking / error / interrupted / unread), a pinned hover panel, per-workspace badges in the left rail, and a Progress tab for long tasks.",
   "exports": {

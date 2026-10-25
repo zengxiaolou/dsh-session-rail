@@ -397,7 +397,73 @@ async function mount(component, props) {
   assert.equal(idleBadge.painted, 0, 'nothing running and nothing waiting: no badge is drawn');
   assert.equal(idleBadge.node.removed, true, 'the badge left over on the row is removed from the DOM');
 
-  console.log('client tabs: 12/12 groups passed');
+  // 13. 官方交互状态优先于日志 verdict：宿主 /turns 还停在 question（旧判定），
+  //     但 `uiSession.sessionStatus` 已经没有 pendingInteraction 时，顶部条与
+  //     左栏都必须按“在跑”算 —— 这就是“答完了还挂着询问”的那个症状。
+  const makeCtxWithPending = (rows, pendingIds) => ({
+    get: (name) => (name === 'sessions'
+      ? { list: { getSnapshot: () => ({ ids: rows.map((row) => row.id), byId: Object.fromEntries(rows.map((row) => [row.id, row])) }), subscribe: () => () => {} } }
+      : name === 'uiSession'
+        ? {
+            sessionStatus: {
+              getSnapshot: () => new Map(pendingIds.map((id) => [id, { running: true, pendingInteraction: { kind: 'question' }, completionUnread: false }])),
+              subscribe: () => () => {},
+            },
+          }
+        : undefined),
+  });
+  const staleRow = [{ id: 's1', displayTitle: '答完还在跑', updatedAt: 2_000, running: true }];
+  bodies['/api/session-rail/turns'] = { ok: true, turns: { s1: { state: 'question', kind: 'ask_user_question', turn: 2 } } };
+
+  states.delete(internals.HeaderCounts);
+  localStore.clear();
+  const clearedCtx = makeCtxWithPending(staleRow, []);
+  const clearedPending = internals.readPendingInteractions(clearedCtx);
+  assert.equal(clearedPending.size, 0, 'the live store reports nobody waiting');
+  await mount(internals.HeaderCounts, { rail: { ctx: clearedCtx, currentId: 'elsewhere' } });
+  const clearedChip = await mount(internals.HeaderCounts, { rail: { ctx: clearedCtx, currentId: 'elsewhere' } });
+  assert.doesNotMatch(clearedChip.text, /询问/, 'a stale verdict cannot pin 询问 once the question is answered');
+  assert.match(clearedChip.text, /运行/, 'the Session counts as running again');
+
+  states.delete(internals.HeaderCounts);
+  localStore.clear();
+  const waitingCtx = makeCtxWithPending(staleRow, ['s1']);
+  await mount(internals.HeaderCounts, { rail: { ctx: waitingCtx, currentId: 'elsewhere' } });
+  const waitingChip = await mount(internals.HeaderCounts, { rail: { ctx: waitingCtx, currentId: 'elsewhere' } });
+  assert.match(waitingChip.text, /询问/, 'a real pending interaction still shows 询问');
+  assert.doesNotMatch(waitingChip.text, /运行/, 'and is not counted as running');
+
+  // 左栏徽标同一套优先级，服务缺失时退回 verdict
+  const wsOne = [{ id: 'w1', title: '探索', sessionIds: ['s1'] }];
+  const staleVerdict = { s1: { state: 'question' } };
+  const cleared = internals.rollupByWorkspace(staleRow, wsOne, staleVerdict, new Set());
+  assert.equal(cleared[0].question, 0, 'no amber badge once the live store cleared');
+  assert.equal(cleared[0].running, 1, 'the badge turns blue instead');
+  assert.equal(internals.rollupByWorkspace(staleRow, wsOne, staleVerdict, new Set(['s1']))[0].question, 1);
+  assert.equal(internals.rollupByWorkspace(staleRow, wsOne, staleVerdict)[0].question, 1, 'no uiSession: verdict is the fallback');
+
+  // 既不在跑也不在等：已有的徽标被摘掉
+  const idleNode = { removed: false, innerHTML: '', attributes: {}, style: {}, setAttribute(n, v) { this.attributes[n] = v; }, remove() { this.removed = true; } };
+  sandbox.document = {
+    querySelectorAll: () => [{ getAttribute: () => 'workspace:w1', querySelector: () => idleNode }],
+    createElement: () => idleNode,
+  };
+  const idleRollup = internals.rollupByWorkspace([{ id: 's1', running: false }], wsOne, { s1: { state: 'done' } }, new Set());
+  assert.equal(idleRollup.length, 0, 'nothing running and nobody waiting: no entry at all');
+  assert.equal(internals.paintWorkspaceBadges(idleRollup, true), 0);
+  assert.equal(idleNode.removed, true, 'the leftover badge is removed from the DOM');
+
+  // ctx.get 对未注入的服务是 strict 的；reflect 读法必须也能拿到同一份状态。
+  const reflectCtx = {
+    get: () => undefined,
+    reflect: { get: (name, strict) => (name === 'uiSession' && strict === false
+      ? { sessionStatus: { getSnapshot: () => new Map([['s1', { pendingInteraction: { kind: 'question' } }]]), subscribe: () => () => {} } }
+      : undefined) },
+  };
+  const viaReflect = internals.readPendingInteractions(reflectCtx);
+  assert.equal(viaReflect.has('s1'), true, 'the non-strict service read still finds the live store');
+
+  console.log('client tabs: 13/13 groups passed');
 })().catch((error) => {
   console.error(error);
   process.exit(1);

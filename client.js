@@ -492,13 +492,66 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Session ids the host's own interaction store reports as waiting on the user.
+     *
+     * `uiSession.sessionStatus` is the store the composer reads, so it clears the
+     * instant a question is answered. A verdict read back from a log tail cannot
+     * see that: it keeps saying "question" while the Session works on. Preferring
+     * the live store is what makes 「询问」 go away without waiting for the turn to
+     * end — and it costs nothing when the host has no such service.
+     *
+     * @returns a Set of Session ids, or null when the service is unavailable (the
+     *          callers then fall back to the host verdict).
+     */
+    function readSessionStatusStore(ctx) {
+      let service;
+      try {
+        service = ctx && typeof ctx.get === 'function' ? ctx.get('uiSession') : undefined;
+      } catch {
+        // `get` is strict about injected services; the reflect read below is not.
+        service = undefined;
+      }
+      if (!service) {
+        try {
+          service = ctx?.reflect?.get?.('uiSession', false) ?? undefined;
+        } catch {
+          service = undefined;
+        }
+      }
+      const status = service?.sessionStatus;
+      if (!status || typeof status.getSnapshot !== 'function') return null;
+      return status;
+    }
+
+    function readPendingInteractions(ctx) {
+      const status = readSessionStatusStore(ctx);
+      if (!status) return null;
+      let snapshot;
+      try {
+        snapshot = status.getSnapshot();
+      } catch {
+        return null;
+      }
+      if (!snapshot || typeof snapshot.forEach !== 'function') return null;
+      const pending = new Set();
+      snapshot.forEach((entry, id) => {
+        if (!entry) return;
+        if (entry.pendingInteraction === undefined || entry.pendingInteraction === null) return;
+        pending.add(String(id));
+      });
+      return pending;
+    }
+
+    /**
      * @param rows - root Sessions from the Client session store.
      * @param store - persisted watermark, or null while the baseline is pending.
      * @param currentId - Session on screen; it is being read, so it is not unread.
      * @param outcomes - host verdict per Session id: running / question / done / interrupted / error.
+     * @param pendingById - live "waiting on the user" ids from `uiSession.sessionStatus`,
+     *                      or null/undefined to fall back to the verdict's `question`.
      * @returns the counts the header shows, split by how the turn is going or ended.
      */
-    function readCounts(rows, store, currentId, outcomes) {
+    function readCounts(rows, store, currentId, outcomes, pendingById) {
       const marks = store?.sessions ?? {};
       const finished = store?.finished ?? {};
       const running = [];
@@ -511,7 +564,10 @@ window.__ModuleLoader__.load({
         if (row.running) {
           // A turn parked on ask_user_question is open but not working: it is
           // waiting for the user, so it must not be counted as busy.
-          if (tone === 'question') question.push(row);
+          const waiting = pendingById === null || pendingById === undefined
+            ? tone === 'question'
+            : pendingById.has(row.id);
+          if (waiting) question.push(row);
           else running.push(row);
           continue;
         }
@@ -651,7 +707,25 @@ window.__ModuleLoader__.load({
         }
       }, [rows, store, currentId]);
 
-      return readCounts(rows, store, currentId, useTurnOutcomes(rows));
+      // The interaction store is what the composer reads, so subscribing to it
+      // makes 「询问」 appear and clear at the same instant the question card does.
+      const [pendingById, setPendingById] = useState(() => readPendingInteractions(ctx));
+      useEffect(() => {
+        const read = () => setPendingById(readPendingInteractions(ctx));
+        read();
+        const status = readSessionStatusStore(ctx);
+        if (!status || typeof status.subscribe !== 'function') return undefined;
+        const dispose = status.subscribe(read);
+        return () => {
+          try {
+            if (typeof dispose === 'function') dispose();
+          } catch {
+            // Same as above: a dead store only stops calling back.
+          }
+        };
+      }, [ctx]);
+
+      return readCounts(rows, store, currentId, useTurnOutcomes(rows), pendingById);
     }
 
     /** Inline styles for the header chip and its hover panel (theme alias tokens only). */
@@ -960,11 +1034,14 @@ window.__ModuleLoader__.load({
      * @param rows - root Sessions, already filtered of blank and subagent rows.
      * @param workspaces - registry projection: `{ id, title, sessionIds }`.
      * @param outcomes - host verdict per Session id.
+     * @param pendingById - live "waiting on the user" ids from `uiSession.sessionStatus`,
+     *                      or null/undefined to fall back to the verdict's `question`.
      * @returns one entry per Workspace that has work right now; Workspaces with
      *          nothing running are dropped here, so the DOM never has to decide.
      */
-    function rollupByWorkspace(rows, workspaces, outcomes) {
+    function rollupByWorkspace(rows, workspaces, outcomes, pendingById) {
       const byId = new Map(rows.map((row) => [row.id, row]));
+      const useLive = pendingById !== null && pendingById !== undefined;
       const out = [];
       for (const workspace of workspaces ?? []) {
         let running = 0;
@@ -972,7 +1049,8 @@ window.__ModuleLoader__.load({
         for (const sessionId of workspace?.sessionIds ?? []) {
           const id = String(sessionId);
           const verdict = outcomes?.[id]?.state;
-          if (verdict === 'question') {
+          const waiting = useLive ? pendingById.has(id) : verdict === 'question';
+          if (waiting) {
             question += 1;
             continue;
           }
@@ -1084,8 +1162,26 @@ window.__ModuleLoader__.load({
 
       const outcomes = useTurnOutcomes(rows);
 
+      // Same live source as the header: the badge must drop the amber "waiting"
+      // the moment the question is answered, not when the whole turn ends.
+      const [pendingById, setPendingById] = useState(() => readPendingInteractions(ctx));
       useEffect(() => {
-        const rollup = rollupByWorkspace(rows, workspaces, outcomes);
+        const read = () => setPendingById(readPendingInteractions(ctx));
+        read();
+        const status = readSessionStatusStore(ctx);
+        if (!status || typeof status.subscribe !== 'function') return undefined;
+        const dispose = status.subscribe(read);
+        return () => {
+          try {
+            if (typeof dispose === 'function') dispose();
+          } catch {
+            // A dead store only stops calling back.
+          }
+        };
+      }, [ctx]);
+
+      useEffect(() => {
+        const rollup = rollupByWorkspace(rows, workspaces, outcomes, pendingById);
         const enabled = workspaceBadgeEnabled();
         const paint = () => {
           try {
@@ -1097,7 +1193,7 @@ window.__ModuleLoader__.load({
         paint();
         const timer = setInterval(paint, BADGE_PAINT_MS);
         return () => clearInterval(timer);
-      }, [rows, workspaces, outcomes]);
+      }, [rows, workspaces, outcomes, pendingById]);
 
       return null;
     }
@@ -1127,7 +1223,7 @@ window.__ModuleLoader__.load({
 
     return {
       /** Pure helpers exposed for the offline client test; the loader only reads `apply`. */
-      internals: { reconcileSeen, readCounts, readSessionRows, HeaderCounts, HEADER_TEXT, SEEN_KEY, rollupByWorkspace, paintWorkspaceBadges, WorkspaceBadges, BADGE_ATTR, BADGE_TOGGLE_KEY },
+      internals: { reconcileSeen, readCounts, readSessionRows, readPendingInteractions, HeaderCounts, HEADER_TEXT, SEEN_KEY, rollupByWorkspace, paintWorkspaceBadges, WorkspaceBadges, BADGE_ATTR, BADGE_TOGGLE_KEY },
       apply(ctx) {
         let locale;
         try {
