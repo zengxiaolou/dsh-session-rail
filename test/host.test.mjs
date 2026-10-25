@@ -43,6 +43,33 @@ const askedEvents = [
   { type: 'tool/result', seq: 3, time: now - 10_000, data: { callId: 'c1' } },
   { type: 'tool/call', seq: 4, time: now - 9_000, data: { name: 'bash', callId: 'c2' } },
 ];
+// What the host actually writes: a tool result carries the assistant's tool
+// message, so the id sits on `data.message.toolCallId`, never on `data.callId`.
+// An answered ask that kept reading as "询问" is what this shape regressed on.
+const answeredRealShapeEvents = [
+  ...askingEvents,
+  {
+    type: 'tool/result',
+    seq: 3,
+    time: now - 10_000,
+    data: { turn: 9, step: 1, message: { role: 'tool', toolCallId: 'c1', source: { kind: 'tool', callId: 'c1' } } },
+  },
+  { type: 'tool/call', seq: 4, time: now - 9_000, data: { turn: 9, step: 1, name: 'bash', callId: 'c2' } },
+];
+// A result that lost its id still has to clear the ask it answers.
+const answeredNoIdEvents = [
+  ...askingEvents,
+  { type: 'tool/result', seq: 3, time: now - 10_000, data: { turn: 9, step: 1, message: { role: 'tool' } } },
+];
+// An ask that belongs to a turn which already ended must not park the next one:
+// the turn boundary is what says the ask was answered or aborted.
+const staleAskPreviousTurnEvents = [
+  { type: 'turn/start', seq: 1, time: now - 60_000, data: { turn: 7 } },
+  { type: 'tool/call', seq: 2, time: now - 55_000, data: { name: 'ask_user_question', callId: 'old' } },
+  { type: 'turn/end', seq: 3, time: now - 50_000, data: { turn: 7, reason: { kind: 'aborted' } } },
+  { type: 'turn/start', seq: 4, time: now - 40_000, data: { turn: 8 } },
+  { type: 'tool/call', seq: 5, time: now - 35_000, data: { name: 'bash', callId: 'c9' } },
+];
 const sessionLogs = {
   's-live': liveEvents,
   's-closed': closedEvents,
@@ -51,6 +78,9 @@ const sessionLogs = {
   's-fork': closedWith('forked'),
   's-ask': askingEvents,
   's-asked': askedEvents,
+  's-asked-real': answeredRealShapeEvents,
+  's-asked-noid': answeredNoIdEvents,
+  's-ask-old': staleAskPreviousTurnEvents,
 };
 const sessionsService = {
   get: (id) => (sessionLogs[id] === undefined ? undefined : makeSession(sessionLogs[id])),
@@ -252,10 +282,25 @@ try {
   assert.deepEqual(res.body.turns, {}, 'no ids is an empty answer, not an error');
 
   // 15. a turn parked on ask_user_question is waiting, not working
-  res = await call('/api/session-rail/turns?ids=s-ask,s-asked');
+  res = await call('/api/session-rail/turns?ids=s-ask,s-asked,s-asked-real,s-asked-noid,s-ask-old');
   assert.equal(res.body.turns['s-ask'].state, 'question', 'an unanswered ask_user_question parks the turn');
   assert.equal(res.body.turns['s-ask'].kind, 'ask_user_question');
   assert.equal(res.body.turns['s-asked'].state, 'running', 'once answered the same Session is working again');
+  assert.equal(
+    res.body.turns['s-asked-real'].state,
+    'running',
+    'the id the host really writes (data.message.toolCallId) clears the ask',
+  );
+  assert.equal(
+    res.body.turns['s-asked-noid'].state,
+    'running',
+    'a result ordering after the ask clears it even without an id',
+  );
+  assert.equal(
+    res.body.turns['s-ask-old'].state,
+    'running',
+    'an ask from a finished turn never parks the next turn',
+  );
 
   // 16. the workspaces route hands the left rail the registry's own membership
   res = await call('/api/session-rail/workspaces');

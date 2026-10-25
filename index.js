@@ -367,6 +367,27 @@ const MAX_TURN_IDS = 24;
 const ASK_TOOL = 'ask_user_question';
 
 /**
+ * Call id of a `tool/result` event.
+ *
+ * The log does not put it at `data.callId`: a result carries the assistant's
+ * tool message, so the id lives on `data.message.toolCallId` (and again on
+ * `data.message.source.callId`). Reading only `data.callId` made every ask
+ * look unanswered — the turn stayed "询问" after the user had already replied
+ * and gone back to work. All three shapes are accepted so a log written by an
+ * older or newer host still resolves.
+ */
+function toolResultCallId(event) {
+  const data = event?.data;
+  if (!data) return undefined;
+  if (typeof data.callId === 'string') return data.callId;
+  const message = data.message;
+  if (typeof message?.toolCallId === 'string') return message.toolCallId;
+  const source = message?.source;
+  if (typeof source?.callId === 'string') return source.callId;
+  return undefined;
+}
+
+/**
  * Last turn's outcome for one Session, read from the tail of its own log.
  *
  * `unknown` is a real answer: a Session that left memory cannot be judged, and
@@ -402,14 +423,26 @@ function readTurnState(ctx, sessionId) {
     // An open turn is not always working: ask_user_question parks it until the
     // user answers. Telling the two apart is what lets the header say "询问"
     // instead of claiming a Session is busy while it is actually waiting.
+    //
+    // Only asks inside the open turn count. A finished turn's ask was answered
+    // or aborted by definition, so letting it through would paint every later
+    // turn of that Session "询问" — the tail scan cannot see across turns.
+    const openFrom = Number(start.seq);
     let pendingCall = null;
+    let pendingSeq = -1;
     const answered = new Set();
     for (const event of events) {
+      if (Number(event?.seq) < openFrom) continue;
       if (event?.type === 'tool/call' && event.data?.name === ASK_TOOL) {
         pendingCall = event.data?.callId ?? `seq:${event.seq}`;
+        pendingSeq = Number(event.seq ?? -1);
       } else if (event?.type === 'tool/result') {
-        const callId = event.data?.callId;
+        const callId = toolResultCallId(event);
         if (callId !== undefined) answered.add(callId);
+        // Tools settle in call order, so a result that lands after the ask and
+        // carries no recoverable id is that ask's answer — better than leaving
+        // a Session painted "询问" for the rest of a long turn.
+        else if (pendingCall !== null && Number(event.seq) > pendingSeq) answered.add(pendingCall);
       }
     }
     const asking = pendingCall !== null && !answered.has(pendingCall);

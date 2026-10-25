@@ -54,14 +54,14 @@
 | 段 | 含义 | 数据来源 |
 | --- | --- | --- |
 | ● N 运行（蓝） | 有活跃回合、且真的在干活的根会话数 | 客户端 `sessions.list` 的 `running` + `/turns` 排除“等你回答” |
-| ● N 询问（橙） | 回合停在 `ask_user_question` 上，等你回答 | 宿主 `/turns` 看当前回合内有无未 `tool/result` 的 `ask_user_question` 调用 |
+| ● N 询问（橙） | 回合停在 `ask_user_question` 上，等你回答 | 宿主 `/turns` 看**当前回合**内有无未 `tool/result` 的 `ask_user_question` 调用 |
 | ● N 出错（红） | 上一个回合以 `blocked` / `error` 结束、且还没看过的 | 宿主 `/turns` 读会话日志尾部的 `turn/end.data.reason.kind` |
 | ● N 中断（灰） | 回合以 `aborted` / `interrupted` 结束（没做完就停了） | 同上 |
 | ● N 未读（绿） | 已正常结束（`completed` / `max-tokens`）、但本浏览器还没看过的 | `updatedAt` 对比已读水位 + `/turns` 判定 |
 
 - **没有现成字段**：DSH 不记录“某个会话是否已读”，所以已读水位由客户端持有——首次加载把当时的全部会话记为已读（否则一上来就是几十条未读），之后“看着的会话”按 `updatedAt` 前进水位，**离开时正在跑、回来已经结束**的会话由 running→false 这次跃迁直接记成未读。
 - **颜色来自会话自己的结局**：`turn/end` 的 `reason.kind` 决定色调——`completed`/`max-tokens` 绿、`aborted`/`interrupted` 中性灰、`blocked`/`error` 红。查不到（会话已离开内存）返回 `unknown`，落回绿色“未读”，不猜成别的颜色。
-- **“在跑”与“等你回答”分开算**：回合开着不等于在干活。当前回合里有 `ask_user_question` 调用、且它的 `tool/result` 还没出现 → `question`，从蓝色里扣掉，进橙色那段（官方 warning 色，和侧栏“等待回答”一致）。
+- **“在跑”与“等你回答”分开算**：回合开着不等于在干活。当前回合里有 `ask_user_question` 调用、且它的 `tool/result` 还没出现 → `question`，从蓝色里扣掉，进橙色那段（官方 warning 色，和侧栏“等待回答”一致）。判定只看**开着的那个回合**：结果事件的 call id 在 `data.message.toolCallId`（不在 `data.callId`），答完之后同一回合继续干活就该回到“运行”，历史回合里没结果的调用也不能把后面的回合算成在等你。
 - **只轮询结局**：运行数订阅 `sessions.list`，状态真变才算；结局每 15s 向宿主批量问一次（单次最多 24 个），页面不可见时不发。
 - **弱干扰**：11px 三级文字色；数字为 0 的那段整段隐藏，五段都为 0 时退化成一颗很淡的点（`data-idle` 0.45 透明度，hover 回到 0.95）。
 - **hover 预览，点击钉住**：hover / 键盘 focus 只是“看一眼”，移开就收起；点一下 chip 把它钉住（`data-pinned`），鼠标走进浮层不会掉，再点一次 / 点外面 / Esc 才关。浮层里的行才是跳转入口。
